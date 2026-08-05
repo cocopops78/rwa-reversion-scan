@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""reversion_analyze.py — mesure la MEAN-REVERSION par couloir depuis le CSV série temporelle
-produit par `builder_depth.py --mode crossing --csv <f>`.
+"""reversion_analyze.py — métriques de mean-reversion par couloir depuis le CSV série
+temporelle produit par `builder_depth.py --mode crossing --csv <f>`.
 
-Le scan builder_depth donne μ/σ TERMINAL ; il n'a jamais testé si le spread REVIENT. Ici on
-répond à « est-ce que ça revient, et à quelle vitesse ? » — le vrai critère d'un edge de
-mean-reversion :
+Le scan donne μ/σ TERMINAL ; il ne teste pas si le spread REVIENT. Ici, par couloir :
   • demi-vie (AR(1) sur le basis démoyenné : Δx = β·x_{t-1}) = temps de retour à mi-écart ;
-  • franchissements de la moyenne / heure = fréquence des aller-retours capturables ;
-  • σ par tranche horaire = évolution intra-séance (ouverture volatile vs creux midi).
+  • franchissements de la moyenne / heure = fréquence des aller-retours ;
+  • σ, edge2σ = 2·grossσ − feesRT ; verdict REVIENT / DÉRIVE.
 
-Un basis à offset persistant (POS%~100) n'est PAS mort : le bot gère l'offset et trade
-l'OSCILLATION autour de μ → on démoyenne par μ avant de mesurer la réversion.
+Un basis à offset persistant (POS%~100) n'oscille pas autour de 0 → on démoyenne par μ
+avant de mesurer la réversion.
 
 Colonnes CSV attendues :
   iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,basis_bps,gross_bps,crossing_bps
 
 CAVEAT : extended/variational sont RFQ (marks cachés) → σ et demi-vie biaisés (sauts
-d'escalier du mark) ; verdict à confirmer micro-live. Les venues carnet (hl-xyz/lighter/vest)
-sont fiables.
+d'escalier du mark), à confirmer. Les venues carnet (hl-xyz/lighter/vest) sont fiables.
 
 Usage : python tools/reversion_analyze.py <fichier.csv> [--min-n 30]
 """
@@ -120,7 +117,7 @@ def main():
           "rapide. crois/h = franchissements de μ par heure = fréquence des aller-retours. "
           "edge2σ = 2·grossσ − feesRT. REVIENT = demi-vie<240min ET crois/h≥1 ET edge>0.")
     print("RFQ (extended/variational) : marks cachés → σ & demi-vie biaisés (sauts d'escalier) ; "
-          "confirmer micro-live. Venues carnet (hl-xyz/lighter/vest) = fiables.")
+          "à confirmer. Venues carnet (hl-xyz/lighter/vest) = fiables.")
 
 
 if __name__ == "__main__":

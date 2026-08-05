@@ -1,73 +1,103 @@
 name: reversion-scan
 
-# Mesure de mean-reversion des couloirs RWA (base=lighter) DEPUIS UNE IP AZURE isolée
-# des bots (contrainte : tous les devices maison partagent 1 IP → un scan lighter local
-# WAF-bloque l'IP des bots live). Keyless (endpoints publics), aucun secret requis.
-# Déclenchement MANUEL (Actions -> Run workflow, ou `gh workflow run reversion-scan.yml`).
-# Repo PUBLIC = minutes Actions illimitées. Pas de cron (éviter runs hors-séance inutiles).
+# Sampler de microstructure multi-venues (base=lighter x hedges), keyless, sur runner Actions.
+# Manuel (Actions -> Run workflow). Cap GitHub-hosted = 6h/job -> couverture ~8h via 2 legs
+# sequentiels (legA -> legB), chacun ~4h ; job "combine" fusionne + analyse.
 
 on:
   workflow_dispatch:
     inputs:
-      minutes:
-        description: "Durée du scan (min ; max ~350 sous le cap Actions de 6h)"
-        default: "350"
+      minutes_per_leg:
+        description: "Minutes par leg (2 legs sequentiels A->B ; couverture ~= 2x ; max 350/leg sous cap 6h)"
+        default: "240"
       hedges:
         description: "Venues hedge contre lighter"
         default: "extended,variational,hl-xyz"
       symbols:
-        description: "Symboles RWA (vide = tout l'univers)"
+        description: "Symboles (vide = tout l'univers)"
         default: ""
       lighter_gap:
-        description: "Throttle lighter : s entre 2 refresh/symbole (anti-429)"
+        description: "Throttle lighter : s entre 2 refresh/symbole"
         default: "25"
       interval:
         description: "Intervalle entre rounds (s)"
         default: "5"
 
 jobs:
-  scan:
+  legA:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Probe lighter (WAF sur l'IP runner ?)
+      - uses: actions/checkout@v4
+      - name: Probe lighter
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails)
           echo "lighter /orderBookDetails -> HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::warning::IP runner Actions bloquée par le WAF lighter (HTTP $code) — les couloirs *:lighter seront VIDES ce run (base=lighter -> rien échantillonné)."
-          else
-            echo "lighter OK depuis l'IP Actions — le scan aura des données lighter."
-          fi
-
-      - name: Scan crossing (base=lighter)
+          [ "$code" = "200" ] || echo "::warning::runner IP -> HTTP $code (couloirs lighter vides ce leg)"
+      - name: Scan leg A
         env:
-          MINUTES: ${{ inputs.minutes }}
-          HEDGES: ${{ inputs.hedges }}
-          SYMS: ${{ inputs.symbols }}
-          LGAP: ${{ inputs.lighter_gap }}
-          INTV: ${{ inputs.interval }}
+          MIN: ${{ inputs.minutes_per_leg }}
+          HED: ${{ inputs.hedges }}
+          SYM: ${{ inputs.symbols }}
+          LG: ${{ inputs.lighter_gap }}
+          IV: ${{ inputs.interval }}
         run: |
-          ARGS="--mode crossing --base lighter --hedges $HEDGES --minutes $MINUTES --interval $INTV --lighter-gap $LGAP --csv reversion.csv --checkpoint-min 20"
-          if [ -n "$SYMS" ]; then ARGS="$ARGS --symbols $SYMS"; fi
-          echo "python3 tools/builder_depth.py $ARGS"
-          python3 tools/builder_depth.py $ARGS
-
-      - name: Analyse réversion
+          A="--mode crossing --base lighter --hedges $HED --minutes $MIN --interval $IV --lighter-gap $LG --csv partA.csv --checkpoint-min 20"
+          if [ -n "$SYM" ]; then A="$A --symbols $SYM"; fi
+          python3 tools/builder_depth.py $A
+      - uses: actions/upload-artifact@v4
         if: always()
+        with:
+          name: part-a
+          path: partA.csv
+          if-no-files-found: warn
+
+  legB:
+    needs: legA
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan leg B
+        env:
+          MIN: ${{ inputs.minutes_per_leg }}
+          HED: ${{ inputs.hedges }}
+          SYM: ${{ inputs.symbols }}
+          LG: ${{ inputs.lighter_gap }}
+          IV: ${{ inputs.interval }}
         run: |
-          if [ -f reversion.csv ]; then
+          B="--mode crossing --base lighter --hedges $HED --minutes $MIN --interval $IV --lighter-gap $LG --csv partB.csv --checkpoint-min 20"
+          if [ -n "$SYM" ]; then B="$B --symbols $SYM"; fi
+          python3 tools/builder_depth.py $B
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-b
+          path: partB.csv
+          if-no-files-found: warn
+
+  combine:
+    needs: [legA, legB]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Merge + analyse
+        run: |
+          : > reversion.csv
+          if [ -f dl/part-a/partA.csv ]; then cat dl/part-a/partA.csv >> reversion.csv; fi
+          if [ -f dl/part-b/partB.csv ]; then cat dl/part-b/partB.csv >> reversion.csv; fi
+          if [ -s reversion.csv ]; then
             python3 tools/reversion_analyze.py reversion.csv | tee reversion_report.txt
           else
-            echo "pas de CSV (scan sans données — WAF ou univers vide)"
+            echo "pas de donnees"
           fi
-
-      - name: Upload CSV + rapport
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: reversion-${{ github.run_id }}
           path: |

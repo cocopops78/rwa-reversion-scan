@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-builder_depth.py — mesure LIVE de la profondeur du carnet Hyperliquid (builder HIP-3 `xyz:*`
-ET vanilla) par symbole, pour estimer le SLIPPAGE RÉEL d'entrée À LA TAILLE.
+builder_depth.py — échantillonne la microstructure de perps multi-venues par symbole,
+à partir d'endpoints publics keyless.
 
-Pourquoi : le paper RWA est aveugle au slippage de latence du builder (prouvé micro-live MU
-explore : détecté 20 bps → réalisé ~11, slip_entrée ~-9 que le paper ne voit pas). Le PnL paper
-hl-xyz est donc un mirage. Le VRAI sélecteur d'un candidat hl-xyz = la profondeur de son carnet
-builder = combien coûte de CROISER à notre taille. Cet outil le mesure à la source (API HL info,
-publique/keyless), là où l'UI du DEX lit.
+Deux modes :
+  depth    : slippage à la taille (VWAP fill vs mid) par snapshots de l2Book, sur
+             Hyperliquid (builder HIP-3 `xyz:*` et vanilla).
+  crossing : distribution basis / gross / crossing sur une fenêtre, avec --csv (série
+             temporelle) + --checkpoint-min, pour l'analyse de mean-reversion
+             (tools/reversion_analyze.py).
 
-Par coin, N snapshots du l2Book. Par snapshot :
-  half_spread_bps = (ask1 - bid1)/mid * 1e4 / 2         (coût immédiat de croisement)
-  slip@$X (bps)   = (VWAP_fill_$X - mid)/mid * 1e4       (buy=walk asks / sell=walk bids ; >0 = coût)
-                    → moyenne des 2 côtés (l'entrée hl-xyz est tantôt buy tantôt sell)
+Métriques (mode depth) :
+  half_spread_bps = (ask1 - bid1)/mid * 1e4 / 2
+  slip@$X (bps)   = (VWAP_fill_$X - mid)/mid * 1e4   (buy=walk asks / sell=walk bids)
   depth L1 $      = min(size1*px1 des 2 côtés)
-Agrège médiane + max sur les snapshots, RANGE par slip@$20.
 
-CAVEAT : mesure INSTANTANÉE → BORNE INFÉRIEURE du slippage réel (qui ajoute la latence exec ~4.4s
-et le mouvement pendant). Si même l'instantané > cap → symbole MORT. Si < cap → PEUT-ÊTRE
-exécutable, à confirmer micro-live. À lancer EN SÉANCE US (carnet le plus profond).
+CAVEAT : mesure INSTANTANÉE = borne inférieure (n'inclut pas la latence d'exécution ni le
+mouvement pendant). À lancer en séance US (carnets les plus profonds). Voir --help.
 
-Usage : python tools/builder_depth.py [--snaps 5] [--gap 5] [--cap 6]
+Usage : python tools/builder_depth.py [--mode depth|crossing] --help
 """
 import json, time, argparse, statistics, urllib.request, sys, os, csv
 
@@ -99,10 +97,10 @@ def agg(snaps, key_fn):
 # ────────────────────────────────────────────────────────────────────────────
 # Mode "crossing" : distribution du crossing (hl-xyz + lighter) et du gross détecté
 # sur une fenêtre de séance, pour trouver le % du temps où un couple (gross≥X, crossing≤Y)
-# tradeable existe. Reproduit EXACTEMENT le calcul du bot :
+# tradeable existe. Calcul (bps) :
 #   mid      = (h_bid+h_ask+l_bid+l_ask)/4
-#   crossing = (h_ask-h_bid)/mid + (l_ask-l_bid)/mid    (bps, somme des 2 fourchettes ; orch:1468)
-#   gross    = max( l_bid-h_ask , h_bid-l_ask )/mid      (bps, meilleure direction ; orch:2441/2501)
+#   crossing = (h_ask-h_bid)/mid + (l_ask-l_bid)/mid    (bps, somme des 2 fourchettes)
+#   gross    = max( l_bid-h_ask , h_bid-l_ask )/mid      (bps, meilleure direction)
 # ────────────────────────────────────────────────────────────────────────────
 
 def _hl_bbo(coin):
@@ -250,7 +248,7 @@ def _crossing_report(samples, base, hedges, partial=False):
               f"{m['gmu']:>+7.1f} {m['gsig']:>7.1f} {m['cr']:>6.1f} {m['fees']:>6.1f} {m['edge']:>+7.1f}  {v}{pf}")
     if not partial:
         print("\nLecture : basisμ/σ = dislocation (hedge−base). μ=offset persistant (géré par "
-              "l'offset du bot), σ=oscillation (= l'edge). POS%~100/0 = basis persistant (offset requis) ; "
+              "un offset externe), σ=oscillation. POS%~100/0 = basis persistant (offset requis) ; "
               "~50 = oscille autour 0. grossσ = σ du spread d'entrée réel (bid/ask, crossing inclus). "
               "edge2σ = 2·grossσ − feesRT = capturable par mean-reversion après frais (>0 = piste réelle).")
         print("après-séance = non représentatif (pas d'arbitrage NASDAQ). Lancer EN SÉANCE US.")
@@ -264,7 +262,7 @@ def crossing_mode(args):
     # → pour ext:var : --base extended --hedges variational.
     # Run LONG (séance complète) : --csv <f> (série brute → reversion_analyze.py),
     # --checkpoint-min N (dump agrégat partiel, anti-perte sur crash), --lighter-gap S
-    # (throttle lighter, anti-429 : le poll bot ET ce scan se font rate-limiter par-IP).
+    # (throttle lighter, anti-429 : l'API lighter rate-limite par-IP sous charge).
     base = (args.base or "hl-xyz").strip()
     hedges = [h.strip() for h in (args.hedges or "lighter,vest").split(",") if h.strip()]
     venues = {base} | set(hedges)
@@ -431,7 +429,7 @@ def main():
               f"{f(m['s100'],9)} {f(m['s1k'],8)} {f(m['d1'],9,0)} {m['n']:>3}  "
               f"{verdict(m['s20'], args.cap)}")
     print("\nLecture : slip@$X = coût moyen (buy+sell)/2 pour croiser $X, en bps. "
-          f"cap IOC = {args.cap:.0f} bps. slip@$20 = taille explore ; slip@$1k = taille RWA paper.")
+          f"cap IOC = {args.cap:.0f} bps. slip@$20 = petite taille ; slip@$1k = grosse taille.")
     print("Rappel : borne INFÉRIEURE (latence exec non incluse). > cap à l'instant = mort d'office.")
 
 
