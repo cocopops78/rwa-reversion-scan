@@ -90,7 +90,12 @@ jobs:
         run: |
           : > reversion.csv
           if [ -f dl/part-a/partA.csv ]; then cat dl/part-a/partA.csv >> reversion.csv; fi
-          if [ -f dl/part-b/partB.csv ]; then cat dl/part-b/partB.csv >> reversion.csv; fi
+          # partB : retirer son en-tête si reversion.csv a déjà celui de partA (sinon 2e header
+          # au milieu → l'analyseur le skippe mais autant le nettoyer).
+          if [ -f dl/part-b/partB.csv ]; then
+            if [ -s reversion.csv ]; then tail -n +2 dl/part-b/partB.csv >> reversion.csv;
+            else cat dl/part-b/partB.csv >> reversion.csv; fi
+          fi
           if [ -s reversion.csv ]; then
             python3 tools/reversion_analyze.py reversion.csv | tee reversion_report.txt
           else

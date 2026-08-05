@@ -60,12 +60,15 @@ def main():
     groups = collections.defaultdict(list)   # (base,hedge,sym) -> [(epoch,basis,gross,crossing)]
     with open(args.csv, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
+            # Parser AVANT d'accéder au groupe : sinon un 2e header (merge partA+partB) ou une
+            # ligne pourrie créerait un groupe VIDE via le defaultdict (float lève après la
+            # création) → statistics.mean([]) crash plus bas. Ici float lève → continue → rien créé.
             try:
-                groups[(r["base"], r["hedge"], r["symbol"])].append(
-                    (float(r["epoch"]), float(r["basis_bps"]),
-                     float(r["gross_bps"]), float(r["crossing_bps"])))
-            except (KeyError, ValueError):
+                rec = (float(r["epoch"]), float(r["basis_bps"]),
+                       float(r["gross_bps"]), float(r["crossing_bps"]))
+            except (KeyError, ValueError, TypeError):
                 continue
+            groups[(r["base"], r["hedge"], r["symbol"])].append(rec)
 
     if not groups:
         print(f"[reversion] aucune donnée exploitable dans {args.csv}")
