@@ -1,0 +1,132 @@
+name: basis-collect
+
+# Echantillonneur de basis inter-instruments (meme venue), keyless, sur runner Actions.
+# Legs SEQUENTIELS (legA -> legB -> legC -> legD) : chacun demarre APRES le precedent -> ils
+# couvrent du temps CONSECUTIF (cap 6h/job -> ~350min/leg max). Le job "combine" agrege les 4
+# CSV en un seul (temps total) et lance l'analyse reversion. Repo public = minutes illimitees.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_per_leg:
+        description: "Minutes par leg (sequentiels ; max 350 sous le cap 6h/job)"
+        default: "330"
+      interval:
+        description: "Secondes entre 2 samples"
+        default: "60"
+      checkpoint_min:
+        description: "Log de progression toutes les N min"
+        default: "30"
+
+jobs:
+  legA:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: collect A
+        env:
+          MIN: ${{ inputs.minutes_per_leg }}
+          IV: ${{ inputs.interval }}
+          CK: ${{ inputs.checkpoint_min }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partA.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-a
+          path: partA.csv
+          if-no-files-found: warn
+
+  legB:
+    needs: legA
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: collect B
+        env:
+          MIN: ${{ inputs.minutes_per_leg }}
+          IV: ${{ inputs.interval }}
+          CK: ${{ inputs.checkpoint_min }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partB.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-b
+          path: partB.csv
+          if-no-files-found: warn
+
+  legC:
+    needs: legB
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: collect C
+        env:
+          MIN: ${{ inputs.minutes_per_leg }}
+          IV: ${{ inputs.interval }}
+          CK: ${{ inputs.checkpoint_min }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partC.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-c
+          path: partC.csv
+          if-no-files-found: warn
+
+  legD:
+    needs: legC
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: collect D
+        env:
+          MIN: ${{ inputs.minutes_per_leg }}
+          IV: ${{ inputs.interval }}
+          CK: ${{ inputs.checkpoint_min }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partD.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-d
+          path: partD.csv
+          if-no-files-found: warn
+
+  combine:
+    needs: [legA, legB, legC, legD]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Aggrege les legs + analyse
+        run: |
+          : > basis_all.csv
+          first=1
+          for p in dl/part-a/partA.csv dl/part-b/partB.csv dl/part-c/partC.csv dl/part-d/partD.csv; do
+            if [ -f "$p" ]; then
+              if [ "$first" = "1" ]; then cat "$p" >> basis_all.csv; first=0;
+              else tail -n +2 "$p" >> basis_all.csv; fi
+            fi
+          done
+          if [ -s basis_all.csv ]; then
+            echo "lignes agregees: $(wc -l < basis_all.csv)"
+            python3 tools/reversion_analyze.py basis_all.csv | tee basis_report.txt
+          else
+            echo "pas de donnees"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: basis-${{ github.run_id }}
+          path: |
+            basis_all.csv
+            basis_report.txt
+          if-no-files-found: warn
