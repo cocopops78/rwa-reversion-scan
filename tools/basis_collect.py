@@ -10,8 +10,9 @@ Sources KEYLESS (market-data publique, aucun secret) :
   * /metadata/stats -> listings[]   (mark_price, base_spread_bps, volume_24h)
 
 Paires par defaut :
-  * XAUT vs XAU   (venue A)
-  * PAXG vs XAU   (venue B)
+  * XAUT vs XAU   (intra-venue)
+  * PAXG vs XAU   (intra-venue)
+  * XAU vs XAU    (cross-venue : meme actif sur 2 venues)
 
 CSV : iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,basis_bps,gross_bps,crossing_bps,spread,vol
   base=hedge=venue ; symbol=<long>-<short> ; base_mid=long mark ; hedge_mid=short mark ;
@@ -32,10 +33,13 @@ UA = {"User-Agent": "Mozilla/5.0"}
 SRC_A = "https://api.starknet.extended.exchange/api/v1/info/markets"
 SRC_B = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
 
-# (venue_tag, long_ticker, short_ticker) — venue_tag doit matcher TAKER_BPS de reversion_analyze
+# (label, long_venue, long_ticker, short_venue, short_ticker) — venues doivent matcher
+# TAKER_BPS de reversion_analyze (base=long_venue, hedge=short_venue). Intra-venue si
+# long_venue == short_venue ; cross-venue (meme actif, 2 venues) sinon.
 PAIRS = [
-    ("variational", "XAUT", "XAU"),
-    ("extended", "PAXG-USD", "XAU-USD"),
+    ("XAUT-XAU", "variational", "XAUT", "variational", "XAU"),      # intra-venue
+    ("PAXG-XAU", "extended", "PAXG-USD", "extended", "XAU-USD"),    # intra-venue
+    ("XAU-var-ext", "variational", "XAU", "extended", "XAU-USD"),   # cross-venue, meme actif
 ]
 
 
@@ -100,15 +104,15 @@ def main():
         mk = _marks()
         ts = time.time()
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
-        for venue, lg, sh in PAIRS:
-            v = mk.get(venue, {})
-            if lg in v and sh in v:
-                lm, lsp, lvol = v[lg]
-                sm, ssp, svol = v[sh]
+        for label, lv, lg, sv, sh in PAIRS:
+            ld = mk.get(lv, {})
+            sd = mk.get(sv, {})
+            if lg in ld and sh in sd:
+                lm, lsp, lvol = ld[lg]
+                sm, ssp, svol = sd[sh]
                 if lm > 0 and sm > 0:
                     basis = (lm - sm) / sm * 1e4
-                    sym = f"{lg.split('-')[0]}-{sh.split('-')[0]}"
-                    w.writerow([iso, f"{ts:.0f}", venue, venue, sym, f"{lm:.6f}", f"{sm:.6f}",
+                    w.writerow([iso, f"{ts:.0f}", lv, sv, label, f"{lm:.6f}", f"{sm:.6f}",
                                 f"{basis:.2f}", f"{abs(basis):.2f}", f"{abs(basis):.2f}",
                                 f"{max(lsp, ssp):.2f}", f"{min(lvol, svol):.0f}"])
                     n += 1
