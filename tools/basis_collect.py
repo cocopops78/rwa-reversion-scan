@@ -32,14 +32,21 @@ except Exception:
 UA = {"User-Agent": "Mozilla/5.0"}
 SRC_A = "https://api.starknet.extended.exchange/api/v1/info/markets"
 SRC_B = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
+# Source C = perps L1 keyless, POST /info {"type":"l2Book","coin":"<index>"} (schema HL-fork).
+# `coin` = INDEX NUMERIQUE (pas le nom). Resolus par prix (mid dans la plage or) : XAUT=46, XAU=51.
+SRC_C = "https://api.txflow.com/info"
+TXFLOW_IDX = {"XAUT": 46, "XAU": 51}
 
 # (label, long_venue, long_ticker, short_venue, short_ticker) — venues doivent matcher
 # TAKER_BPS de reversion_analyze (base=long_venue, hedge=short_venue). Intra-venue si
 # long_venue == short_venue ; cross-venue (meme actif, 2 venues) sinon.
 PAIRS = [
-    ("XAUT-XAU", "variational", "XAUT", "variational", "XAU"),      # intra-venue
-    ("PAXG-XAU", "extended", "PAXG-USD", "extended", "XAU-USD"),    # intra-venue
-    ("XAU-var-ext", "variational", "XAU", "extended", "XAU-USD"),   # cross-venue, meme actif
+    ("XAUT-XAU-var", "variational", "XAUT", "variational", "XAU"),  # intra var
+    ("XAUT-XAU-txf", "txflow", "XAUT", "txflow", "XAU"),            # intra TxFlow
+    ("XAU-txf-var",  "txflow", "XAU",  "variational", "XAU"),       # cross meme actif (XAU)
+    ("XAUT-txf-var", "txflow", "XAUT", "variational", "XAUT"),      # cross meme actif (XAUT)
+    ("XAU-var-ext",  "variational", "XAU", "extended", "XAU-USD"),  # cross meme actif (garde)
+    ("PAXG-XAU-ext", "extended", "PAXG-USD", "extended", "XAU-USD"),# intra extended (garde)
 ]
 
 
@@ -48,9 +55,17 @@ def _get(url):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _post(url, body):
+    hdr = {**UA, "Content-Type": "application/json",
+           "Origin": "https://app.txflow.com", "Referer": "https://app.txflow.com/"}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=hdr)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def _marks():
     """{venue: {ticker: (mark, spread_bps, vol)}} — keyless, tolerant aux pannes reseau."""
-    out = {"extended": {}, "variational": {}}
+    out = {"extended": {}, "variational": {}, "txflow": {}}
     try:
         for m in _get(SRC_A).get("data", []):
             ms = m.get("marketStats", {})
@@ -75,6 +90,22 @@ def _marks():
                                       float(it.get("volume_24h", 0) or 0))
     except Exception as e:
         print(f"[basis] source B KO: {type(e).__name__}: {e}", flush=True)
+    try:
+        for name, idx in TXFLOW_IDX.items():
+            j = _post(SRC_C, {"type": "l2Book", "coin": str(idx)})
+            lv = j.get("levels")
+            if not lv or not lv[0] or not lv[1]:
+                continue
+            bid = float(lv[0][0]["px"]); ask = float(lv[1][0]["px"])
+            mid = (bid + ask) / 2
+            if not (4000 < mid < 4600):   # garde-fou : l'index a change de marche -> skip
+                print(f"[basis] txflow {name} idx {idx} hors plage or (mid={mid:.1f}) — verifier index", flush=True)
+                continue
+            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+            vol = float(lv[0][0].get("sz", 0) or 0) * mid   # proxy = profondeur best bid en $
+            out["txflow"][name] = (mid, spr, vol)
+    except Exception as e:
+        print(f"[basis] source C (txflow) KO: {type(e).__name__}: {e}", flush=True)
     return out
 
 
