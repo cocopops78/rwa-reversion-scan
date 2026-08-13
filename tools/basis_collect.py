@@ -36,17 +36,36 @@ SRC_B = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/sta
 # `coin` = INDEX NUMERIQUE (pas le nom). Resolus par prix (mid dans la plage or) : XAUT=46, XAU=51.
 SRC_C = "https://api.txflow.com/info"
 TXFLOW_IDX = {"XAUT": 46, "XAU": 51}
+# Source D = lighter (carnet keyless). orderBookOrders best bid/ask -> mid. market_id par symbole.
+# NB: lighter a XAU et PAXG mais PAS XAUT. Depuis un runner GHA (IP != bot) -> pas de conflit WAF.
+SRC_D = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders"
+LIGHTER_IDS = {"XAU": 92, "PAXG": 48}
+# Source E = paradex (carnet keyless). /v1/orderbook/{market}. Or : SEULEMENT PAXG (0-fee taker).
+SRC_E = "https://api.prod.paradex.trade/v1/orderbook"
+PARADEX_MARKETS = {"PAXG-USD-PERP": "PAXG-USD-PERP"}
 
 # (label, long_venue, long_ticker, short_venue, short_ticker) — venues doivent matcher
 # TAKER_BPS de reversion_analyze (base=long_venue, hedge=short_venue). Intra-venue si
 # long_venue == short_venue ; cross-venue (meme actif, 2 venues) sinon.
+# Actifs par venue : txflow=XAU/XAUT · variational=XAU/XAUT/PAXG · extended=XAU/PAXG ·
+# lighter=XAU/PAXG · paradex=PAXG (0-fee).
 PAIRS = [
-    ("XAUT-XAU-var", "variational", "XAUT", "variational", "XAU"),  # intra var
-    ("XAUT-XAU-txf", "txflow", "XAUT", "txflow", "XAU"),            # intra TxFlow
-    ("XAU-txf-var",  "txflow", "XAU",  "variational", "XAU"),       # cross meme actif (XAU)
-    ("XAUT-txf-var", "txflow", "XAUT", "variational", "XAUT"),      # cross meme actif (XAUT)
-    ("XAU-var-ext",  "variational", "XAU", "extended", "XAU-USD"),  # cross meme actif (garde)
-    ("PAXG-XAU-ext", "extended", "PAXG-USD", "extended", "XAU-USD"),# intra extended (garde)
+    # --- CROSS-VENUE meme actif (tradeable) ---
+    ("XAU-txf-lit",  "txflow", "XAU",  "lighter", "XAU"),            # LE combo maker (hedge lighter)
+    ("XAU-txf-var",  "txflow", "XAU",  "variational", "XAU"),
+    ("XAU-var-lit",  "variational", "XAU", "lighter", "XAU"),
+    ("XAU-var-ext",  "variational", "XAU", "extended", "XAU-USD"),
+    ("XAU-ext-lit",  "extended", "XAU-USD", "lighter", "XAU"),
+    ("XAUT-txf-var", "txflow", "XAUT", "variational", "XAUT"),       # XAUT : que txf+var
+    ("PAXG-par-lit", "paradex", "PAXG-USD-PERP", "lighter", "PAXG"), # paradex 0-fee vs lighter
+    ("PAXG-par-var", "paradex", "PAXG-USD-PERP", "variational", "PAXG"),
+    ("PAXG-par-ext", "paradex", "PAXG-USD-PERP", "extended", "PAXG-USD"),
+    ("PAXG-var-lit", "variational", "PAXG", "lighter", "PAXG"),
+    ("PAXG-ext-lit", "extended", "PAXG-USD", "lighter", "PAXG"),
+    # --- INTRA-VENUE (observation) ---
+    ("XAUT-XAU-var", "variational", "XAUT", "variational", "XAU"),
+    ("XAUT-XAU-txf", "txflow", "XAUT", "txflow", "XAU"),
+    ("PAXG-XAU-ext", "extended", "PAXG-USD", "extended", "XAU-USD"),
 ]
 
 
@@ -65,7 +84,7 @@ def _post(url, body):
 
 def _marks():
     """{venue: {ticker: (mark, spread_bps, vol)}} — keyless, tolerant aux pannes reseau."""
-    out = {"extended": {}, "variational": {}, "txflow": {}}
+    out = {"extended": {}, "variational": {}, "txflow": {}, "lighter": {}, "paradex": {}}
     try:
         for m in _get(SRC_A).get("data", []):
             ms = m.get("marketStats", {})
@@ -106,6 +125,31 @@ def _marks():
             out["txflow"][name] = (mid, spr, vol)
     except Exception as e:
         print(f"[basis] source C (txflow) KO: {type(e).__name__}: {e}", flush=True)
+    try:
+        for name, mid_id in LIGHTER_IDS.items():
+            j = _get(f"{SRC_D}?market_id={mid_id}&limit=1")
+            asks = j.get("asks") or []; bids = j.get("bids") or []
+            if not asks or not bids:
+                continue
+            ask = float(asks[0]["price"]); bid = float(bids[0]["price"])
+            mid = (bid + ask) / 2
+            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+            sz = float(asks[0].get("remaining_base_amount") or 0)
+            out["lighter"][name] = (mid, spr, sz * mid)
+    except Exception as e:
+        print(f"[basis] source D (lighter) KO: {type(e).__name__}: {e}", flush=True)
+    try:
+        for name in PARADEX_MARKETS:
+            j = _get(f"{SRC_E}/{name}?depth=1")
+            a = j.get("asks") or []; b = j.get("bids") or []
+            if not a or not b:
+                continue
+            ask = float(a[0][0]); bid = float(b[0][0]); mid = (bid + ask) / 2
+            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+            sz = float(a[0][1]) if len(a[0]) > 1 else 0.0
+            out["paradex"][name] = (mid, spr, sz * mid)
+    except Exception as e:
+        print(f"[basis] source E (paradex) KO: {type(e).__name__}: {e}", flush=True)
     return out
 
 

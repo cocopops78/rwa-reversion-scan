@@ -27,7 +27,8 @@ except Exception:
 
 # taker/jambe (bps) — même table que builder_depth.py. RT = 2×(base+hedge).
 TAKER_BPS = {"hl-xyz": 0.9, "lighter": 0.0, "vest": 1.0, "extended": 2.25, "variational": 0.0,
-             "txflow": 1.0}  # placeholder — confirmer le vrai taker TxFlow
+             "txflow": 4.5,   # taker VIP0 0.045% (maker 0.015%)
+             "paradex": 0.0}  # 0-fee (mais carnet fin -> slippage, cf spr)
 
 
 def _halflife(x, dt_min):
