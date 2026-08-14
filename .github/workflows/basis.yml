@@ -17,6 +17,9 @@ on:
       checkpoint_min:
         description: "Log de progression toutes les N min"
         default: "30"
+      universe:
+        description: "crypto (24/7, OK weekend) ou rwa (equities -> JOUR DE SEMAINE, US ouvert)"
+        default: "crypto"
 
 jobs:
   legA:
@@ -29,7 +32,8 @@ jobs:
           MIN: ${{ inputs.minutes_per_leg }}
           IV: ${{ inputs.interval }}
           CK: ${{ inputs.checkpoint_min }}
-        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partA.csv
+          UNI: ${{ inputs.universe }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --universe $UNI --csv partA.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -49,7 +53,8 @@ jobs:
           MIN: ${{ inputs.minutes_per_leg }}
           IV: ${{ inputs.interval }}
           CK: ${{ inputs.checkpoint_min }}
-        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partB.csv
+          UNI: ${{ inputs.universe }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --universe $UNI --csv partB.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,7 +74,8 @@ jobs:
           MIN: ${{ inputs.minutes_per_leg }}
           IV: ${{ inputs.interval }}
           CK: ${{ inputs.checkpoint_min }}
-        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partC.csv
+          UNI: ${{ inputs.universe }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --universe $UNI --csv partC.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -89,7 +95,8 @@ jobs:
           MIN: ${{ inputs.minutes_per_leg }}
           IV: ${{ inputs.interval }}
           CK: ${{ inputs.checkpoint_min }}
-        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --csv partD.csv
+          UNI: ${{ inputs.universe }}
+        run: python3 tools/basis_collect.py --minutes $MIN --interval $IV --checkpoint-min $CK --universe $UNI --csv partD.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
