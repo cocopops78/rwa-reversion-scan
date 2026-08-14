@@ -1,37 +1,39 @@
 #!/usr/bin/env python3
-"""basis_collect.py — echantillonneur de basis CROSS-VENUE sur venues CARNET.
+"""basis_collect.py — echantillonneur de basis CROSS-VENUE (tous DEX connus, RFQ + CLOB).
 
-Successeur du collecteur or (run-1..4 : verdict = pas d'edge exploitable). Scanne un univers
-de tokens sur les venues A CARNET (les RFQ = mirages de marks, cf run-4). Pour chaque token
-present sur >=2 venues, enregistre le basis (bps) de CHAQUE paire de venues dans le temps ->
-reversion_analyze.py mesure si ca OSCILLE assez (2*grossσ) pour battre les frais aller-retour.
+Successeur du collecteur or (run-1..4 : pas d'edge). Scanne un univers de tokens sur TOUTES
+les venues connues du bot. Pour chaque token present sur >=2 venues, enregistre le basis (bps)
+de CHAQUE paire de venues dans le temps -> reversion_analyze.py mesure si ca OSCILLE assez
+(2*grossσ) pour battre les frais aller-retour.
 
 FILTRE CLE (lecon de l'or) : ne retenir qu'un couloir dont edge2σ = 2·grossσ − feesRT est
-positif AVEC MARGE (>= +3 bps, pas +0.1), demi-vie < 240 min, CONV reelle, ET spread carnet
-serre (sinon = mirage de mid, cf paradex 193bps).
+positif AVEC MARGE (>= +3 bps), demi-vie < 240 min, CONV reelle, ET spread carnet serre. Les
+venues RFQ (variational ; extended sur RWA) = MIRAGES de marks (σ gonfle) -> a discounter.
 
 Deux UNIVERS (--universe) :
-  * crypto : BTC..DOGE sur extended/lighter/paradex/hyperliquid — marches 24/7, OK le WEEKEND.
-  * rwa    : XAU/equities sur extended/lighter/hl-xyz (builder HIP-3). [!] Les EQUITIES sont
-             FERMEES le week-end (marks geles -> data inexploitable) -> lancer un JOUR DE
-             SEMAINE en session US. hl-xyz cote le gold sous 'xyz:GOLD'.
+  * crypto : 15 bluechips x extended/lighter/paradex/hyperliquid/txflow/variational/vest — 24/7,
+             OK le WEEKEND.
+  * rwa    : XAU/equities x extended/lighter/hl-xyz/variational/vest. [!] EQUITIES FERMEES le WE
+             -> lancer un JOUR DE SEMAINE (session US). hl-xyz cote le gold sous 'xyz:GOLD'.
 
 Sources KEYLESS (aucun secret) :
-  * extended    : GET /api/v1/info/markets            (marketStats mark/bid/ask/dailyVolume)
-  * lighter     : GET /api/v1/orderBooks (map symbol->market_id auto) + /orderBookOrders best bid/ask
-  * paradex     : GET /v1/orderbook/{TOKEN-USD-PERP}  (best bid/ask)
-  * hyperliquid : POST /info {"type":"allMids"}            (mid principal, crypto)
-  * hl-xyz      : POST /info {"type":"allMids","dex":"xyz"} (mid builder RWA ; cles 'xyz:TICKER')
+  * extended    : GET /api/v1/info/markets              (marketStats ; RWA extended = RFQ)
+  * lighter     : GET /api/v1/orderBooks (map auto) + /orderBookOrders   (CLOB)
+  * paradex     : GET /v1/orderbook/{TOKEN-USD-PERP}    (CLOB)
+  * hyperliquid : POST /info {"type":"allMids"}         (CLOB, mid crypto)
+  * hl-xyz      : POST /info {"type":"allMids","dex":"xyz"}  (CLOB builder, cles 'xyz:TICKER')
+  * txflow      : POST /info {"type":"l2Book","coin":"<idx>"}  (CLOB HL-fork ; index connus BTC/ETH)
+  * variational : GET /metadata/stats -> listings[]     (RFQ : mark_price/base_spread_bps)
+  * vest        : GET /v2/exchangeInfo (map auto) + /v2/depth?symbol=  (CLOB)
 
 CSV (schema reversion_analyze) : iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,
   basis_bps,gross_bps,crossing_bps,spread,vol. base/hedge = VENUE ; spread = jambe la plus
   mince (bps, garde-fou executabilite) ; vol = profondeur min ($).
 
-[!] WEEKEND : la vol crypto est plus basse le WE -> grossσ possiblement SOUS-estime (test
-conservateur). Les EQUITIES sont carrement fermees -> universe=rwa a lancer en semaine.
+[!] WEEKEND : vol crypto plus basse -> grossσ SOUS-estime (conservateur). EQUITIES fermees
+-> universe=rwa a lancer en semaine.
 
-Usage :
-  python tools/basis_collect.py --universe crypto --minutes 330 --interval 60 --csv part.csv
+Usage : python tools/basis_collect.py --universe crypto --minutes 330 --interval 60 --csv part.csv
 """
 import sys, os, csv, time, json, argparse, urllib.request, itertools
 
@@ -44,14 +46,17 @@ UA = {"User-Agent": "Mozilla/5.0"}
 
 UNIVERSES = {
     "crypto": {
-        "tokens": ["BTC", "ETH", "SOL", "XRP", "AVAX", "LINK", "DOGE"],
-        "venues": ["extended", "lighter", "paradex", "hyperliquid"],
+        "tokens": ["BTC", "ETH", "SOL", "XRP", "BNB", "TRX", "DOGE", "ADA",
+                   "AVAX", "LINK", "LTC", "DOT", "SUI", "TON", "BCH"],
+        "venues": ["extended", "lighter", "paradex", "hyperliquid", "txflow", "variational", "vest"],
         "hlxyz": {},
+        "txflow_idx": {"BTC": 1, "ETH": 2},   # index l2Book connus (meta 403 -> statique)
     },
     "rwa": {   # [!] equities FERMEES le WE -> lancer un jour de semaine (session US)
         "tokens": ["XAU", "SPCX", "MRVL", "NVDA", "TSLA", "MU"],
-        "venues": ["extended", "lighter", "hl-xyz"],
-        "hlxyz": {"XAU": "GOLD"},   # token -> ticker xyz (defaut = token) ; gold = xyz:GOLD
+        "venues": ["extended", "lighter", "hl-xyz", "variational", "vest"],
+        "hlxyz": {"XAU": "GOLD"},              # token -> ticker xyz ; gold = xyz:GOLD
+        "txflow_idx": {},                      # txflow gold deja teste (run-4 negatif)
     },
 }
 
@@ -60,8 +65,12 @@ LIT_BOOKS = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 LIT_ORD   = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders"
 PAR_URL   = "https://api.prod.paradex.trade/v1/orderbook"
 HL_URL    = "https://api.hyperliquid.xyz/info"
+TXF_URL   = "https://api.txflow.com/info"
+VAR_URL   = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
+VEST_URL  = "https://server-prod.hz.vestmarkets.com"
 
-_LIT_IDS = {}   # symbol -> market_id (auto au boot)
+_LIT_IDS = {}    # token -> lighter market_id (auto)
+_VEST_SYM = {}   # token -> vest symbol (auto, ex BTC -> BTC-PERP)
 
 
 def _get(url):
@@ -69,15 +78,17 @@ def _get(url):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _post(url, body):
+def _post(url, body, origin=None):
     hdr = {**UA, "Content-Type": "application/json"}
+    if origin:
+        hdr["Origin"] = origin; hdr["Referer"] = origin + "/"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=hdr)
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def _discover_lighter_ids(tokens):
-    """symbol -> market_id via /orderBooks (jamais devine : cf piege sz_decimals lighter)."""
+def _discover(tokens):
+    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest."""
     tokset = set(tokens)
     try:
         j = _get(LIT_BOOKS)
@@ -89,14 +100,24 @@ def _discover_lighter_ids(tokens):
                 _LIT_IDS[sym] = int(mid)
     except Exception as e:
         print(f"[basis] lighter ids KO: {type(e).__name__}: {e}", flush=True)
-    print(f"[basis] lighter market_ids: {_LIT_IDS}", flush=True)
+    try:
+        d = _get(f"{VEST_URL}/v2/exchangeInfo")
+        syms = d.get("symbols", d) if isinstance(d, dict) else d
+        for m in syms:
+            s = str(m.get("symbol", ""))
+            base = s.split("-")[0].upper()
+            if base in tokset and m.get("tradingStatus", "TRADING") == "TRADING":
+                _VEST_SYM[base] = s
+    except Exception as e:
+        print(f"[basis] vest syms KO: {type(e).__name__}: {e}", flush=True)
+    print(f"[basis] lighter ids: {_LIT_IDS}", flush=True)
+    print(f"[basis] vest syms: {_VEST_SYM}", flush=True)
 
 
-def _marks(tokens, venues, hlxyz_map):
+def _marks(tokens, venues, hlxyz_map, txflow_idx):
     """{venue: {token: (mid, spread_bps, vol$)}} — keyless, tolerant aux pannes par venue."""
     out = {v: {} for v in venues}
     tokset = set(tokens)
-    # --- extended (carnet ; RWA sur extended = RFQ -> mark dispo mais executabilite caveat) ---
     if "extended" in venues:
         try:
             want = {f"{t}-USD": t for t in tokens}
@@ -114,7 +135,6 @@ def _marks(tokens, venues, hlxyz_map):
                 out["extended"][want[nm]] = (mk, spr, float(ms.get("dailyVolume", 0) or 0))
         except Exception as e:
             print(f"[basis] extended KO: {type(e).__name__}: {e}", flush=True)
-    # --- lighter (carnet) ---
     if "lighter" in venues:
         for t, mid_id in _LIT_IDS.items():
             if t not in tokset:
@@ -130,7 +150,6 @@ def _marks(tokens, venues, hlxyz_map):
                 out["lighter"][t] = (m, spr, sz * m)
             except Exception:
                 pass
-    # --- paradex (carnet ; crypto + PAXG) ---
     if "paradex" in venues:
         for t in tokens:
             try:
@@ -144,7 +163,6 @@ def _marks(tokens, venues, hlxyz_map):
                 out["paradex"][t] = (m, spr, sz * m)
             except Exception:
                 pass
-    # --- hyperliquid MAIN (crypto ; mid, carnet tres liquide -> spread~0) ---
     if "hyperliquid" in venues:
         try:
             mids = _post(HL_URL, {"type": "allMids"})
@@ -154,17 +172,58 @@ def _marks(tokens, venues, hlxyz_map):
                     out["hyperliquid"][t] = (float(v), 0.0, 0.0)
         except Exception as e:
             print(f"[basis] hyperliquid KO: {type(e).__name__}: {e}", flush=True)
-    # --- hl-xyz (builder HIP-3 RWA ; mid via allMids dex=xyz, cles 'xyz:TICKER') ---
     if "hl-xyz" in venues:
         try:
             mids = _post(HL_URL, {"type": "allMids", "dex": "xyz"})
             for t in tokens:
-                key = "xyz:" + hlxyz_map.get(t, t)
-                v = mids.get(key)
+                v = mids.get("xyz:" + hlxyz_map.get(t, t))
                 if v:
                     out["hl-xyz"][t] = (float(v), 0.0, 0.0)
         except Exception as e:
             print(f"[basis] hl-xyz KO: {type(e).__name__}: {e}", flush=True)
+    if "txflow" in venues:
+        for t, idx in txflow_idx.items():
+            if t not in tokset:
+                continue
+            try:
+                j = _post(TXF_URL, {"type": "l2Book", "coin": str(idx)}, origin="https://app.txflow.com")
+                lv = j.get("levels")
+                if not lv or not lv[0] or not lv[1]:
+                    continue
+                bid = float(lv[0][0]["px"]); ask = float(lv[1][0]["px"]); m = (bid + ask) / 2
+                spr = (ask - bid) / m * 1e4 if m > 0 else 0.0
+                vol = float(lv[0][0].get("sz", 0) or 0) * m
+                out["txflow"][t] = (m, spr, vol)
+            except Exception:
+                pass
+    if "variational" in venues:
+        try:
+            for it in _get(VAR_URL).get("listings", []):
+                tk = str(it.get("ticker", "")).upper()
+                if tk not in tokset:
+                    continue
+                mk = it.get("mark_price")
+                if not mk:
+                    continue
+                out["variational"][tk] = (float(mk), float(it.get("base_spread_bps", 0) or 0),
+                                          float(it.get("volume_24h", 0) or 0))
+        except Exception as e:
+            print(f"[basis] variational KO: {type(e).__name__}: {e}", flush=True)
+    if "vest" in venues:
+        for t, vsym in _VEST_SYM.items():
+            if t not in tokset:
+                continue
+            try:
+                d = _get(f"{VEST_URL}/v2/depth?symbol={vsym}")
+                bids = d.get("bids") or []; asks = d.get("asks") or []
+                if not bids or not asks:
+                    continue
+                bb = max(float(p) for p, _ in bids); ba = min(float(p) for p, _ in asks)
+                m = (bb + ba) / 2
+                spr = (ba - bb) / m * 1e4 if m > 0 else 0.0
+                out["vest"][t] = (m, spr, 0.0)
+            except Exception:
+                pass
     return out
 
 
@@ -179,11 +238,10 @@ def main():
     args = ap.parse_args()
 
     uni = UNIVERSES[args.universe]
-    tokens, venues, hlxyz = uni["tokens"], uni["venues"], uni["hlxyz"]
-    _discover_lighter_ids(tokens)
-    # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si une venue est muette (un run non
-    # surveille ne doit pas decouvrir a J+1 qu'un token/venue etait vide).
-    _probe = _marks(tokens, venues, hlxyz)
+    tokens, venues, hlxyz, txf = uni["tokens"], uni["venues"], uni["hlxyz"], uni["txflow_idx"]
+    _discover(tokens)
+    # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si une venue est muette.
+    _probe = _marks(tokens, venues, hlxyz, txf)
     print("[basis] couverture initiale: " +
           " · ".join(f"{v}={len(_probe.get(v, {}))}/{len(tokens)}" for v in venues), flush=True)
     venue_pairs = list(itertools.combinations(venues, 2))
@@ -198,9 +256,9 @@ def main():
 
     t0 = time.time(); end = t0 + args.minutes * 60; n = 0; last_ck = t0
     print(f"[basis] start [{args.universe}] — {args.minutes:.0f}min @ {args.interval:.0f}s · "
-          f"tokens={tokens} · venues={venues} -> {args.csv}", flush=True)
+          f"{len(tokens)} tokens · {len(venues)} venues -> {args.csv}", flush=True)
     while time.time() < end:
-        mk = _marks(tokens, venues, hlxyz)
+        mk = _marks(tokens, venues, hlxyz, txf)
         ts = time.time()
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
         for va, vb in venue_pairs:
