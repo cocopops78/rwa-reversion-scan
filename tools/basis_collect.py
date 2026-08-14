@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
-"""basis_collect.py — echantillonneur de basis inter-instruments correles (meme venue).
+"""basis_collect.py — echantillonneur de basis CROSS-VENUE sur venues CARNET (perp liquides).
 
-Deux instruments proches cotes sur la MEME venue : on enregistre leur ecart (basis, bps)
-dans le temps pour voir s'il OSCILLE (reversion, exploitable) ou reste un discount
-PERSISTANT (non exploitable). Sortie CSV au schema de reversion_analyze.py.
+Successeur du collecteur or (run-1..4 : verdict = pas d'edge exploitable). Ici on scanne un
+univers LARGE de tokens crypto liquides sur les venues A CARNET uniquement (les RFQ = mirages
+de marks, cf run-4 : variational/txflow retires). Pour chaque token present sur >=2 venues, on
+enregistre le basis (bps) de CHAQUE paire de venues dans le temps -> reversion_analyze.py mesure
+si ca OSCILLE assez (2*grossσ) pour battre les frais aller-retour.
+
+FILTRE CLE (la lecon de l'or) : ne retenir qu'un couloir dont edge2σ = 2·grossσ − feesRT est
+positif AVEC MARGE (>= +3 bps, pas +0.1), demi-vie < 240 min, CONV reelle, ET spread carnet
+serre (sinon = mirage de mid, cf paradex 193bps).
 
 Sources KEYLESS (market-data publique, aucun secret) :
-  * /api/v1/info/markets            (marketStats.markPrice, bid/ask)
-  * /metadata/stats -> listings[]   (mark_price, base_spread_bps, volume_24h)
+  * extended    : GET /api/v1/info/markets            (marketStats mark/bid/ask/dailyVolume)
+  * lighter     : GET /api/v1/orderBooks (map symbol->market_id, auto) + /orderBookOrders best bid/ask
+  * paradex     : GET /v1/orderbook/{TOKEN-USD-PERP}  (best bid/ask)
+  * hyperliquid : POST /info {"type":"allMids"}       (mid ; carnet HL tres liquide -> spread~0)
 
-Paires par defaut :
-  * XAUT vs XAU   (intra-venue)
-  * PAXG vs XAU   (intra-venue)
-  * XAU vs XAU    (cross-venue : meme actif sur 2 venues)
+CSV (schema reversion_analyze) : iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,
+  basis_bps,gross_bps,crossing_bps,spread,vol. base/hedge = VENUE ; symbol = <TOKEN>-<va>-<vb>.
+  spread = jambe la plus mince (bps) = garde-fou executabilite. vol = profondeur min ($).
 
-CSV : iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,basis_bps,gross_bps,crossing_bps,spread,vol
-  base=hedge=venue ; symbol=<long>-<short> ; base_mid=long mark ; hedge_mid=short mark ;
-  basis_bps=(long-short)/short*1e4 (signe) ; gross_bps=|basis| ; spread/vol = jambe la plus
-  mince (juger mark perime vs reel). Colonnes surnumeraires ignorees par reversion_analyze.
+[!] WEEKEND : la liquidite/vol crypto est plus basse le WE -> grossσ possiblement SOUS-estime.
+Un couloir qui ressort quand meme le WE est prometteur (test conservateur) ; un couloir marginal
+est a re-mesurer en semaine (session US) avant tout live.
 
 Usage :
   python tools/basis_collect.py --minutes 330 --interval 60 --csv part.csv --checkpoint-min 30
 """
-import sys, os, csv, time, json, argparse, urllib.request
+import sys, os, csv, time, json, argparse, urllib.request, itertools
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30,43 +36,21 @@ except Exception:
     pass
 
 UA = {"User-Agent": "Mozilla/5.0"}
-SRC_A = "https://api.starknet.extended.exchange/api/v1/info/markets"
-SRC_B = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
-# Source C = perps L1 keyless, POST /info {"type":"l2Book","coin":"<index>"} (schema HL-fork).
-# `coin` = INDEX NUMERIQUE (pas le nom). Resolus par prix (mid dans la plage or) : XAUT=46, XAU=51.
-SRC_C = "https://api.txflow.com/info"
-TXFLOW_IDX = {"XAUT": 46, "XAU": 51}
-# Source D = lighter (carnet keyless). orderBookOrders best bid/ask -> mid. market_id par symbole.
-# NB: lighter a XAU et PAXG mais PAS XAUT. Depuis un runner GHA (IP != bot) -> pas de conflit WAF.
-SRC_D = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders"
-LIGHTER_IDS = {"XAU": 92, "PAXG": 48}
-# Source E = paradex (carnet keyless). /v1/orderbook/{market}. Or : SEULEMENT PAXG (0-fee taker).
-SRC_E = "https://api.prod.paradex.trade/v1/orderbook"
-PARADEX_MARKETS = {"PAXG-USD-PERP": "PAXG-USD-PERP"}
 
-# (label, long_venue, long_ticker, short_venue, short_ticker) — venues doivent matcher
-# TAKER_BPS de reversion_analyze (base=long_venue, hedge=short_venue). Intra-venue si
-# long_venue == short_venue ; cross-venue (meme actif, 2 venues) sinon.
-# Actifs par venue : txflow=XAU/XAUT · variational=XAU/XAUT/PAXG · extended=XAU/PAXG ·
-# lighter=XAU/PAXG · paradex=PAXG (0-fee).
-PAIRS = [
-    # --- CROSS-VENUE meme actif (tradeable) ---
-    ("XAU-txf-lit",  "txflow", "XAU",  "lighter", "XAU"),            # LE combo maker (hedge lighter)
-    ("XAU-txf-var",  "txflow", "XAU",  "variational", "XAU"),
-    ("XAU-var-lit",  "variational", "XAU", "lighter", "XAU"),
-    ("XAU-var-ext",  "variational", "XAU", "extended", "XAU-USD"),
-    ("XAU-ext-lit",  "extended", "XAU-USD", "lighter", "XAU"),
-    ("XAUT-txf-var", "txflow", "XAUT", "variational", "XAUT"),       # XAUT : que txf+var
-    ("PAXG-par-lit", "paradex", "PAXG-USD-PERP", "lighter", "PAXG"), # paradex 0-fee vs lighter
-    ("PAXG-par-var", "paradex", "PAXG-USD-PERP", "variational", "PAXG"),
-    ("PAXG-par-ext", "paradex", "PAXG-USD-PERP", "extended", "PAXG-USD"),
-    ("PAXG-var-lit", "variational", "PAXG", "lighter", "PAXG"),
-    ("PAXG-ext-lit", "extended", "PAXG-USD", "lighter", "PAXG"),
-    # --- INTRA-VENUE (observation) ---
-    ("XAUT-XAU-var", "variational", "XAUT", "variational", "XAU"),
-    ("XAUT-XAU-txf", "txflow", "XAUT", "txflow", "XAU"),
-    ("PAXG-XAU-ext", "extended", "PAXG-USD", "extended", "XAU-USD"),
-]
+# Univers : tokens crypto liquides x venues A CARNET (sigma fiable). Ajuster au besoin.
+TOKENS = ["BTC", "ETH", "SOL", "XRP", "AVAX", "LINK", "DOGE"]
+CARNET = ["extended", "lighter", "paradex", "hyperliquid"]
+
+EXT_URL   = "https://api.starknet.extended.exchange/api/v1/info/markets"
+LIT_BOOKS = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
+LIT_ORD   = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders"
+PAR_URL   = "https://api.prod.paradex.trade/v1/orderbook"
+HL_URL    = "https://api.hyperliquid.xyz/info"
+
+EXT_SYM = {t: f"{t}-USD" for t in TOKENS}        # extended : BTC-USD
+PAR_SYM = {t: f"{t}-USD-PERP" for t in TOKENS}   # paradex  : BTC-USD-PERP
+HL_SYM  = {t: t for t in TOKENS}                 # HL       : BTC
+_LIT_IDS = {}                                    # lighter  : symbol -> market_id (auto au boot)
 
 
 def _get(url):
@@ -74,82 +58,85 @@ def _get(url):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _post(url, body):
-    hdr = {**UA, "Content-Type": "application/json",
-           "Origin": "https://app.txflow.com", "Referer": "https://app.txflow.com/"}
+def _post(url, body, origin=None):
+    hdr = {**UA, "Content-Type": "application/json"}
+    if origin:
+        hdr["Origin"] = origin
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=hdr)
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def _marks():
-    """{venue: {ticker: (mark, spread_bps, vol)}} — keyless, tolerant aux pannes reseau."""
-    out = {"extended": {}, "variational": {}, "txflow": {}, "lighter": {}, "paradex": {}}
+def _discover_lighter_ids():
+    """symbol -> market_id via /orderBooks (jamais devine : cf piege sz_decimals lighter)."""
     try:
-        for m in _get(SRC_A).get("data", []):
+        j = _get(LIT_BOOKS)
+        rows = j.get("order_books") or j.get("orderBooks") or (j if isinstance(j, list) else [])
+        for ob in rows:
+            sym = str(ob.get("symbol", "")).upper().split("-")[0].split("/")[0]
+            mid = ob.get("market_id", ob.get("id"))
+            if sym in TOKENS and mid is not None:
+                _LIT_IDS[sym] = int(mid)
+    except Exception as e:
+        print(f"[basis] lighter ids KO: {type(e).__name__}: {e}", flush=True)
+    print(f"[basis] lighter market_ids decouverts: {_LIT_IDS}", flush=True)
+
+
+def _marks():
+    """{venue: {token: (mid, spread_bps, vol$)}} — keyless, tolerant aux pannes par venue."""
+    out = {v: {} for v in CARNET}
+    # --- extended (carnet) ---
+    try:
+        want = {v: k for k, v in EXT_SYM.items()}
+        for m in _get(EXT_URL).get("data", []):
+            nm = m.get("name")
+            if nm not in want:
+                continue
             ms = m.get("marketStats", {})
             mk = ms.get("markPrice") or ms.get("lastPrice")
             if not mk:
                 continue
             mk = float(mk)
-            bid = float(ms.get("bidPrice", 0) or 0)
-            ask = float(ms.get("askPrice", 0) or 0)
+            bid = float(ms.get("bidPrice", 0) or 0); ask = float(ms.get("askPrice", 0) or 0)
             spr = ((ask - bid) / mk * 1e4) if (bid > 0 and ask > 0 and mk > 0) else 0.0
-            vol = float(ms.get("dailyVolume", 0) or 0)
-            out["extended"][m["name"]] = (mk, spr, vol)
+            out["extended"][want[nm]] = (mk, spr, float(ms.get("dailyVolume", 0) or 0))
     except Exception as e:
-        print(f"[basis] source A KO: {type(e).__name__}: {e}", flush=True)
-    try:
-        for it in _get(SRC_B).get("listings", []):
-            tk = str(it.get("ticker", "")).upper()
-            mk = it.get("mark_price")
-            if not mk:
-                continue
-            out["variational"][tk] = (float(mk), float(it.get("base_spread_bps", 0) or 0),
-                                      float(it.get("volume_24h", 0) or 0))
-    except Exception as e:
-        print(f"[basis] source B KO: {type(e).__name__}: {e}", flush=True)
-    try:
-        for name, idx in TXFLOW_IDX.items():
-            j = _post(SRC_C, {"type": "l2Book", "coin": str(idx)})
-            lv = j.get("levels")
-            if not lv or not lv[0] or not lv[1]:
-                continue
-            bid = float(lv[0][0]["px"]); ask = float(lv[1][0]["px"])
-            mid = (bid + ask) / 2
-            if not (4000 < mid < 4600):   # garde-fou : l'index a change de marche -> skip
-                print(f"[basis] txflow {name} idx {idx} hors plage or (mid={mid:.1f}) — verifier index", flush=True)
-                continue
-            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
-            vol = float(lv[0][0].get("sz", 0) or 0) * mid   # proxy = profondeur best bid en $
-            out["txflow"][name] = (mid, spr, vol)
-    except Exception as e:
-        print(f"[basis] source C (txflow) KO: {type(e).__name__}: {e}", flush=True)
-    try:
-        for name, mid_id in LIGHTER_IDS.items():
-            j = _get(f"{SRC_D}?market_id={mid_id}&limit=1")
+        print(f"[basis] extended KO: {type(e).__name__}: {e}", flush=True)
+    # --- lighter (carnet) ---
+    for t, mid_id in _LIT_IDS.items():
+        try:
+            j = _get(f"{LIT_ORD}?market_id={mid_id}&limit=1")
             asks = j.get("asks") or []; bids = j.get("bids") or []
             if not asks or not bids:
                 continue
-            ask = float(asks[0]["price"]); bid = float(bids[0]["price"])
-            mid = (bid + ask) / 2
-            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+            ask = float(asks[0]["price"]); bid = float(bids[0]["price"]); m = (bid + ask) / 2
+            spr = (ask - bid) / m * 1e4 if m > 0 else 0.0
             sz = float(asks[0].get("remaining_base_amount") or 0)
-            out["lighter"][name] = (mid, spr, sz * mid)
-    except Exception as e:
-        print(f"[basis] source D (lighter) KO: {type(e).__name__}: {e}", flush=True)
-    try:
-        for name in PARADEX_MARKETS:
-            j = _get(f"{SRC_E}/{name}?depth=1")
+            out["lighter"][t] = (m, spr, sz * m)
+        except Exception:
+            pass
+    # --- paradex (carnet) ---
+    for t, mkt in PAR_SYM.items():
+        try:
+            j = _get(f"{PAR_URL}/{mkt}?depth=1")
             a = j.get("asks") or []; b = j.get("bids") or []
             if not a or not b:
                 continue
-            ask = float(a[0][0]); bid = float(b[0][0]); mid = (bid + ask) / 2
-            spr = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+            ask = float(a[0][0]); bid = float(b[0][0]); m = (bid + ask) / 2
+            spr = (ask - bid) / m * 1e4 if m > 0 else 0.0
             sz = float(a[0][1]) if len(a[0]) > 1 else 0.0
-            out["paradex"][name] = (mid, spr, sz * mid)
+            out["paradex"][t] = (m, spr, sz * m)
+        except Exception:
+            pass
+    # --- hyperliquid (carnet tres liquide : mid via allMids, spread~0 assume) ---
+    try:
+        mids = _post(HL_URL, {"type": "allMids"})
+        for t in TOKENS:
+            v = mids.get(HL_SYM[t])
+            if v:
+                out["hyperliquid"][t] = (float(v), 0.0, 0.0)
     except Exception as e:
-        print(f"[basis] source E (paradex) KO: {type(e).__name__}: {e}", flush=True)
+        print(f"[basis] hyperliquid KO: {type(e).__name__}: {e}", flush=True)
     return out
 
 
@@ -161,41 +148,44 @@ def main():
     ap.add_argument("--checkpoint-min", type=float, default=30.0)
     args = ap.parse_args()
 
+    _discover_lighter_ids()
+    # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si chaque venue renvoie des tokens —
+    # un run weekend non surveille ne doit pas decouvrir a J+2 qu'une venue etait muette.
+    _probe = _marks()
+    print("[basis] couverture initiale: " +
+          " · ".join(f"{v}={len(_probe.get(v, {}))}/{len(TOKENS)}" for v in CARNET), flush=True)
+    venue_pairs = list(itertools.combinations(CARNET, 2))   # une fois par paire de venues
+
     cols = ["iso_time", "epoch", "base", "hedge", "symbol", "base_mid", "hedge_mid",
             "basis_bps", "gross_bps", "crossing_bps", "spread", "vol"]
     new = (not os.path.exists(args.csv)) or os.path.getsize(args.csv) == 0
     f = open(args.csv, "a", newline="", encoding="utf-8")
     w = csv.writer(f)
     if new:
-        w.writerow(cols)
-        f.flush()
+        w.writerow(cols); f.flush()
 
-    t0 = time.time()
-    end = t0 + args.minutes * 60
-    n = 0
-    last_ck = t0
-    print(f"[basis] start — {args.minutes:.0f}min @ {args.interval:.0f}s -> {args.csv}", flush=True)
+    t0 = time.time(); end = t0 + args.minutes * 60; n = 0; last_ck = t0
+    print(f"[basis] start — {args.minutes:.0f}min @ {args.interval:.0f}s · tokens={TOKENS} · "
+          f"venues={CARNET} -> {args.csv}", flush=True)
     while time.time() < end:
         mk = _marks()
         ts = time.time()
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
-        for label, lv, lg, sv, sh in PAIRS:
-            ld = mk.get(lv, {})
-            sd = mk.get(sv, {})
-            if lg in ld and sh in sd:
-                lm, lsp, lvol = ld[lg]
-                sm, ssp, svol = sd[sh]
-                if lm > 0 and sm > 0:
-                    basis = (lm - sm) / sm * 1e4
-                    w.writerow([iso, f"{ts:.0f}", lv, sv, label, f"{lm:.6f}", f"{sm:.6f}",
-                                f"{basis:.2f}", f"{abs(basis):.2f}", f"{abs(basis):.2f}",
-                                f"{max(lsp, ssp):.2f}", f"{min(lvol, svol):.0f}"])
-                    n += 1
+        for va, vb in venue_pairs:
+            da = mk.get(va, {}); db = mk.get(vb, {})
+            for t in TOKENS:
+                if t in da and t in db:
+                    am, asp, avol = da[t]; bm, bsp, bvol = db[t]
+                    if am > 0 and bm > 0:
+                        basis = (am - bm) / bm * 1e4
+                        w.writerow([iso, f"{ts:.0f}", va, vb, f"{t}-{va[:3]}-{vb[:3]}",
+                                    f"{am:.6f}", f"{bm:.6f}", f"{basis:.2f}", f"{abs(basis):.2f}",
+                                    f"{abs(basis):.2f}", f"{max(asp, bsp):.2f}", f"{min(avol, bvol):.0f}"])
+                        n += 1
         f.flush()
         if time.time() - last_ck >= args.checkpoint_min * 60:
             print(f"[basis] checkpoint — {n} lignes, {(time.time() - t0) / 60:.0f}min", flush=True)
             last_ck = time.time()
-        # sortie propre si le reste de temps < interval
         if time.time() + args.interval >= end:
             break
         time.sleep(args.interval)
