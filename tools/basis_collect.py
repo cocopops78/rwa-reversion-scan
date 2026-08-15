@@ -64,6 +64,17 @@ UNIVERSES = {
         # absents de hl-xyz. Le reste (MU/SPCX/SNDK/DRAM/CL/MRVL/NVDA/TSLA) = meme nom.
         "hlxyz": {"XAU": "GOLD", "XAG": "SILVER", "SPY": "SP500"},
     },
+    "gold": {   # 3 INSTRUMENTS or distincts (pas 1 token) : XAU spot / XAUT Tether / PAXG Paxos.
+        # cross_instrument -> apparie TOUTES les jambes (venue:instrument) : couvre les 3 categories
+        # (1inst-2ven · 2inst-2ven · 2inst-1ven). XAUT n'a qu'UN carnet reel = txflow(idx46).
+        "tokens": ["XAU", "XAUT", "PAXG"],
+        "venues": ["rise", "lighter", "txflow", "hl-xyz", "hyperliquid", "extended", "variational"],
+        "hlxyz": {"XAU": "GOLD"},                # hl-xyz : seul GOLD (=XAU). XAUT/PAXG absents de xyz.
+        "cross_instrument": True,
+        "txf_static": {"XAU": 51, "XAUT": 46},   # price-match ne distingue pas 3 ors a <1% -> index
+        # statique VERIFIE au boot (bande-or 3500-5500$ ; rejet si re-index silencieux). vest exclu
+        # (PAXG-PERP HALT). hyperliquid/hl-xyz = mid SANS spread carnet. extended/variational = RFQ.
+    },
 }
 
 EXT_URL   = "https://api.starknet.extended.exchange/api/v1/info/markets"
@@ -124,8 +135,10 @@ def _discover_txflow(ref_prices, max_idx=90):
             _TXF_IDX[best_t] = idx
 
 
-def _discover(tokens, venues, hlxyz):
-    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest + rise + txflow."""
+def _discover(tokens, venues, hlxyz, txf_static=None):
+    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest + rise + txflow.
+    txf_static (univers gold) : {inst: idx} verifie en bande-or, car le price-match ne sait PAS
+    distinguer 3 ors a <1% l'un de l'autre."""
     tokset = set(tokens)
     try:
         j = _get(LIT_BOOKS)
@@ -156,7 +169,21 @@ def _discover(tokens, venues, hlxyz):
                     _RISE_ID[base] = str(mk["market_id"])
         except Exception as e:
             print(f"[basis] rise ids KO: {type(e).__name__}: {e}", flush=True)
-    if "txflow" in venues:
+    if "txflow" in venues and txf_static:      # or : index statique (price-match ne distingue pas 3 ors)
+        for t, idx in txf_static.items():
+            if t not in tokset:
+                continue
+            try:
+                j = _post(TXF_URL, {"type": "l2Book", "coin": str(idx)}, origin="https://app.txflow.com")
+                lv = j.get("levels")
+                mid = (float(lv[0][0]["px"]) + float(lv[1][0]["px"])) / 2 if (lv and lv[0] and lv[1]) else 0.0
+                if 3500 < mid < 5500:          # garde bande-or : rejette un re-index silencieux
+                    _TXF_IDX[t] = idx
+                else:
+                    print(f"[basis] txflow {t} idx{idx} mid={mid:.1f} HORS bande-or -> ignore", flush=True)
+            except Exception as e:
+                print(f"[basis] txflow {t} idx{idx} KO: {type(e).__name__}: {e}", flush=True)
+    elif "txflow" in venues:
         refp = {}
         try:                                   # crypto : reference HL main
             main = _post(HL_URL, {"type": "allMids"})
@@ -331,7 +358,8 @@ def main():
 
     uni = UNIVERSES[args.universe]
     tokens, venues, hlxyz = uni["tokens"], uni["venues"], uni["hlxyz"]
-    _discover(tokens, venues, hlxyz)
+    cross = uni.get("cross_instrument", False)   # gold : apparie TOUTES les jambes (venue:instrument)
+    _discover(tokens, venues, hlxyz, uni.get("txf_static"))
     # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si une venue est muette.
     _probe = _marks(tokens, venues, hlxyz)
     print("[basis] couverture initiale: " +
@@ -353,18 +381,33 @@ def main():
         mk = _marks(tokens, venues, hlxyz)
         ts = time.time()
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
-        for va, vb in venue_pairs:
-            da = mk.get(va, {}); db = mk.get(vb, {})
-            for t in tokens:
-                if t in da and t in db:
-                    am, asp, avol = da[t]; bm, bsp, bvol = db[t]
-                    if am > 0 and bm > 0:
-                        basis = (am - bm) / bm * 1e4
-                        lab = f"{t}-{va.replace('-', '')[:3]}-{vb.replace('-', '')[:3]}"
-                        w.writerow([iso, f"{ts:.0f}", va, vb, lab,
-                                    f"{am:.6f}", f"{bm:.6f}", f"{basis:.2f}", f"{abs(basis):.2f}",
-                                    f"{abs(basis):.2f}", f"{max(asp, bsp):.2f}", f"{min(avol, bvol):.0f}"])
-                        n += 1
+        if cross:
+            # OR : toutes les jambes tracent l'or -> apparie CHAQUE paire de jambes (venue:instrument).
+            # Couvre les 3 categories : meme inst/2 ven · 2 inst/2 ven · 2 inst/MEME venue.
+            legs = [(v, t, m, sp, vol) for v in venues
+                    for t, (m, sp, vol) in mk.get(v, {}).items() if m > 0]
+            for L1, L2 in itertools.combinations(legs, 2):
+                # orientation stable (sinon un reconnect flip base/hedge -> 2 groupes distincts)
+                (va, ia, am, asp, avol), (vb, ib, bm, bsp, bvol) = sorted([L1, L2], key=lambda z: (z[0], z[1]))
+                basis = (am - bm) / bm * 1e4
+                lab = f"{ia}.{va.replace('-', '')[:3]}/{ib}.{vb.replace('-', '')[:3]}"
+                w.writerow([iso, f"{ts:.0f}", f"{va}:{ia}", f"{vb}:{ib}", lab,
+                            f"{am:.6f}", f"{bm:.6f}", f"{basis:.2f}", f"{abs(basis):.2f}",
+                            f"{abs(basis):.2f}", f"{max(asp, bsp):.2f}", f"{min(avol, bvol):.0f}"])
+                n += 1
+        else:
+            for va, vb in venue_pairs:
+                da = mk.get(va, {}); db = mk.get(vb, {})
+                for t in tokens:
+                    if t in da and t in db:
+                        am, asp, avol = da[t]; bm, bsp, bvol = db[t]
+                        if am > 0 and bm > 0:
+                            basis = (am - bm) / bm * 1e4
+                            lab = f"{t}-{va.replace('-', '')[:3]}-{vb.replace('-', '')[:3]}"
+                            w.writerow([iso, f"{ts:.0f}", va, vb, lab,
+                                        f"{am:.6f}", f"{bm:.6f}", f"{basis:.2f}", f"{abs(basis):.2f}",
+                                        f"{abs(basis):.2f}", f"{max(asp, bsp):.2f}", f"{min(avol, bvol):.0f}"])
+                            n += 1
         f.flush()
         if time.time() - last_ck >= args.checkpoint_min * 60:
             print(f"[basis] checkpoint — {n} lignes, {(time.time() - t0) / 60:.0f}min", flush=True)

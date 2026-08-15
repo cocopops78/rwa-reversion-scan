@@ -85,7 +85,7 @@ def main():
         print(f"[reversion] aucune donnée exploitable dans {args.csv}")
         return
 
-    hdr = (f"{'SYM':13} {'base':11} {'hedge':11} {'n':>5} {'span_h':>6} {'basisμ':>8} "
+    hdr = (f"{'SYM':18} {'base':16} {'hedge':16} {'CAT':5} {'n':>5} {'span_h':>6} {'basisμ':>8} "
            f"{'grossσ':>7} {'spread':>7} {'demi-vie':>9} {'crois/h':>7} {'edge2σ':>7}  verdict")
     print(hdr)
     print("-" * len(hdr))
@@ -108,7 +108,8 @@ def main():
         crossings = sum(1 for i in range(1, n) if (x[i] > 0) != (x[i - 1] > 0))
         cph = crossings / span_h
         beta, hl = _halflife(x, dt_min)
-        fees = 2 * (TAKER_BPS.get(base, 0.0) + TAKER_BPS.get(hedge, 0.0))
+        # base/hedge = "venue" (crypto/rwa) ou "venue:instrument" (gold) -> frais lus sur la venue.
+        fees = 2 * (TAKER_BPS.get(base.split(":")[0], 0.0) + TAKER_BPS.get(hedge.split(":")[0], 0.0))
         edge = 2 * gsig - fees
         # MIRAGE : carnet cassé/illiquide (spread énorme) → l'edge est un artefact de MID, PAS
         # exécutable (ex paradex sur alts : spread 90-6470 bps). On MARQUE, on n'exclut pas la venue.
@@ -126,7 +127,13 @@ def main():
             verdict = "DÉRIVE (pas de réversion)"
         else:
             verdict = "réversion faible/bruit"
-        out.append((sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict))
+        # CAT (univers gold) : base/hedge = "venue:instrument" -> 1i2v / 2i2v / 2i1v
+        if ":" in base and ":" in hedge:
+            va, ia = base.split(":", 1); vb, ib = hedge.split(":", 1)
+            cat = "1i2v" if ia == ib else ("2i1v" if va == vb else "2i2v")
+        else:
+            cat = ""
+        out.append((sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict, cat))
 
     if args.by_token:
         # Par TOKEN (comparer venue1:venue2 pour chaque token), puis edge2σ décroissant.
@@ -135,9 +142,9 @@ def main():
         # MIRAGE/MISMATCH en dernier, REVIENT en premier, puis edge2σ décroissant.
         out.sort(key=lambda r: (r[11].startswith(("MIRAGE", "MISMATCH")),
                                 not r[11].startswith("REVIENT"), -r[10]))
-    for sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict in out:
+    for sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict, cat in out:
         hl_s = f"{hl:>9.0f}" if hl is not None else f"{'—':>9}"
-        print(f"{sym:13} {base:11} {hedge:11} {n:>5} {span_h:>6.1f} {bmu:>+8.1f} "
+        print(f"{sym:18} {base:16} {hedge:16} {cat:5} {n:>5} {span_h:>6.1f} {bmu:>+8.1f} "
               f"{gsig:>7.1f} {spread_mu:>7.1f} {hl_s} {cph:>7.1f} {edge:>+7.1f}  {verdict}")
     print("\nLecture : grossσ = amplitude d'oscillation ; spread = carnet moyen (jambe la plus mince, "
           "garde-fou exécutabilité) ; edge2σ = 2·grossσ − feesRT. REVIENT = demi-vie<240min ET "
@@ -145,6 +152,8 @@ def main():
     print("RFQ INCLUS (variational ; extended sur RWA) : marks cachés → σ possiblement gonflé, à "
           "confirmer sur la durée. Venues carnet (lighter/extended/hyperliquid/vest) = fiables. "
           "--by-token pour comparer par token.")
+    print("CAT (univers gold) : 1i2v = même instrument, 2 venues · 2i2v = 2 instruments, 2 venues · "
+          "2i1v = 2 instruments, MÊME venue (le plus propre, ex XAU/XAUT sur txflow — pas de désync).")
 
 
 if __name__ == "__main__":
