@@ -56,7 +56,7 @@ UNIVERSES = {
     },
     "rwa": {   # [!] equities FERMEES le WE -> lancer un jour de semaine (session US)
         "tokens": ["XAU", "SPCX", "MRVL", "NVDA", "TSLA", "MU"],
-        "venues": ["extended", "lighter", "hl-xyz", "variational", "vest"],
+        "venues": ["extended", "lighter", "hl-xyz", "variational", "vest", "txflow", "rise"],
         "hlxyz": {"XAU": "GOLD"},              # token -> ticker xyz ; gold = xyz:GOLD
     },
 }
@@ -92,15 +92,11 @@ def _post(url, body, origin=None):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _discover_txflow(tokens, max_idx=90):
+def _discover_txflow(ref_prices, max_idx=90):
     """txflow : meta/allMids en 403 -> impossible d'ENUMERER. On scanne l2Book par INDEX et on
-    matche chaque mid au prix de REFERENCE hyperliquid (meme instant) a ±1.5% -> token->index.
-    Robuste au re-indexing (fini le hardcode BTC/ETH ; BNB=3, SOL=13, DOGE=10... decouverts)."""
-    try:
-        ref = _post(HL_URL, {"type": "allMids"})
-        refp = {t: float(ref[t]) for t in tokens if ref.get(t)}
-    except Exception as e:
-        print(f"[basis] txflow ref HL KO: {type(e).__name__}: {e}", flush=True); return
+    matche chaque mid aux prix de REFERENCE (HL main pour crypto ; hl-xyz pour RWA) a ±1.5% ->
+    token->index. Robuste au re-indexing (BNB=3, SOL=13 en crypto ; XAU=51, TSLA=59, MU=79 en RWA)."""
+    refp = ref_prices
     for idx in range(0, max_idx):
         try:
             j = _post(TXF_URL, {"type": "l2Book", "coin": str(idx)}, origin="https://app.txflow.com")
@@ -123,8 +119,8 @@ def _discover_txflow(tokens, max_idx=90):
             _TXF_IDX[best_t] = idx
 
 
-def _discover(tokens, venues):
-    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest + txflow."""
+def _discover(tokens, venues, hlxyz):
+    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest + rise + txflow."""
     tokset = set(tokens)
     try:
         j = _get(LIT_BOOKS)
@@ -156,7 +152,26 @@ def _discover(tokens, venues):
         except Exception as e:
             print(f"[basis] rise ids KO: {type(e).__name__}: {e}", flush=True)
     if "txflow" in venues:
-        _discover_txflow(tokens)
+        refp = {}
+        try:                                   # crypto : reference HL main
+            main = _post(HL_URL, {"type": "allMids"})
+            for t in tokens:
+                if main.get(t):
+                    refp[t] = float(main[t])
+        except Exception:
+            pass
+        if any(t not in refp for t in tokens):  # RWA / tokens absents de HL main -> reference hl-xyz
+            try:
+                xyz = _post(HL_URL, {"type": "allMids", "dex": "xyz"})
+                for t in tokens:
+                    if t in refp:
+                        continue
+                    v = xyz.get("xyz:" + hlxyz.get(t, t))
+                    if v:
+                        refp[t] = float(v)
+            except Exception:
+                pass
+        _discover_txflow(refp)
     print(f"[basis] lighter ids: {_LIT_IDS}", flush=True)
     print(f"[basis] vest syms: {_VEST_SYM}", flush=True)
     print(f"[basis] rise ids: {_RISE_ID}", flush=True)
@@ -303,7 +318,7 @@ def main():
 
     uni = UNIVERSES[args.universe]
     tokens, venues, hlxyz = uni["tokens"], uni["venues"], uni["hlxyz"]
-    _discover(tokens, venues)
+    _discover(tokens, venues, hlxyz)
     # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si une venue est muette.
     _probe = _marks(tokens, venues, hlxyz)
     print("[basis] couverture initiale: " +
