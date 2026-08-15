@@ -52,13 +52,11 @@ UNIVERSES = {
                    "AVAX", "LINK", "LTC", "DOT", "SUI", "TON", "BCH"],
         "venues": ["extended", "lighter", "paradex", "hyperliquid", "txflow", "variational", "vest"],
         "hlxyz": {},
-        "txflow_idx": {"BTC": 1, "ETH": 2},   # index l2Book connus (meta 403 -> statique)
     },
     "rwa": {   # [!] equities FERMEES le WE -> lancer un jour de semaine (session US)
         "tokens": ["XAU", "SPCX", "MRVL", "NVDA", "TSLA", "MU"],
         "venues": ["extended", "lighter", "hl-xyz", "variational", "vest"],
         "hlxyz": {"XAU": "GOLD"},              # token -> ticker xyz ; gold = xyz:GOLD
-        "txflow_idx": {},                      # txflow gold deja teste (run-4 negatif)
     },
 }
 
@@ -73,6 +71,7 @@ VEST_URL  = "https://server-prod.hz.vestmarkets.com"
 
 _LIT_IDS = {}    # token -> lighter market_id (auto)
 _VEST_SYM = {}   # token -> vest symbol (auto, ex BTC -> BTC-PERP)
+_TXF_IDX = {}    # token -> txflow l2Book index (auto, price-match ; meta/allMids 403)
 
 
 def _get(url):
@@ -89,8 +88,39 @@ def _post(url, body, origin=None):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _discover(tokens):
-    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest."""
+def _discover_txflow(tokens, max_idx=90):
+    """txflow : meta/allMids en 403 -> impossible d'ENUMERER. On scanne l2Book par INDEX et on
+    matche chaque mid au prix de REFERENCE hyperliquid (meme instant) a ±1.5% -> token->index.
+    Robuste au re-indexing (fini le hardcode BTC/ETH ; BNB=3, SOL=13, DOGE=10... decouverts)."""
+    try:
+        ref = _post(HL_URL, {"type": "allMids"})
+        refp = {t: float(ref[t]) for t in tokens if ref.get(t)}
+    except Exception as e:
+        print(f"[basis] txflow ref HL KO: {type(e).__name__}: {e}", flush=True); return
+    for idx in range(0, max_idx):
+        try:
+            j = _post(TXF_URL, {"type": "l2Book", "coin": str(idx)}, origin="https://app.txflow.com")
+            lv = j.get("levels")
+            if not lv or not lv[0] or not lv[1]:
+                continue
+            mid = (float(lv[0][0]["px"]) + float(lv[1][0]["px"])) / 2
+        except Exception:
+            continue
+        if mid <= 0:
+            continue
+        best_t, best_d = None, 0.015   # matche au token le plus proche, pas encore mappe
+        for t, p in refp.items():
+            if t in _TXF_IDX or p <= 0:
+                continue
+            d = abs(mid - p) / p
+            if d < best_d:
+                best_t, best_d = t, d
+        if best_t:
+            _TXF_IDX[best_t] = idx
+
+
+def _discover(tokens, venues):
+    """Auto-decouverte des ids/symboles par venue (jamais devine). lighter + vest + txflow."""
     tokset = set(tokens)
     try:
         j = _get(LIT_BOOKS)
@@ -112,11 +142,14 @@ def _discover(tokens):
                 _VEST_SYM[base] = s
     except Exception as e:
         print(f"[basis] vest syms KO: {type(e).__name__}: {e}", flush=True)
+    if "txflow" in venues:
+        _discover_txflow(tokens)
     print(f"[basis] lighter ids: {_LIT_IDS}", flush=True)
     print(f"[basis] vest syms: {_VEST_SYM}", flush=True)
+    print(f"[basis] txflow idx (auto price-match): {_TXF_IDX}", flush=True)
 
 
-def _marks(tokens, venues, hlxyz_map, txflow_idx):
+def _marks(tokens, venues, hlxyz_map):
     """{venue: {token: (mid, spread_bps, vol$)}} — keyless, tolerant aux pannes par venue."""
     out = {v: {} for v in venues}
     tokset = set(tokens)
@@ -184,7 +217,7 @@ def _marks(tokens, venues, hlxyz_map, txflow_idx):
         except Exception as e:
             print(f"[basis] hl-xyz KO: {type(e).__name__}: {e}", flush=True)
     if "txflow" in venues:
-        for t, idx in txflow_idx.items():
+        for t, idx in _TXF_IDX.items():
             if t not in tokset:
                 continue
             try:
@@ -240,10 +273,10 @@ def main():
     args = ap.parse_args()
 
     uni = UNIVERSES[args.universe]
-    tokens, venues, hlxyz, txf = uni["tokens"], uni["venues"], uni["hlxyz"], uni["txflow_idx"]
-    _discover(tokens)
+    tokens, venues, hlxyz = uni["tokens"], uni["venues"], uni["hlxyz"]
+    _discover(tokens, venues)
     # Sonde de couverture (1 cycle) : voir TOUT DE SUITE si une venue est muette.
-    _probe = _marks(tokens, venues, hlxyz, txf)
+    _probe = _marks(tokens, venues, hlxyz)
     print("[basis] couverture initiale: " +
           " · ".join(f"{v}={len(_probe.get(v, {}))}/{len(tokens)}" for v in venues), flush=True)
     venue_pairs = list(itertools.combinations(venues, 2))
@@ -260,7 +293,7 @@ def main():
     print(f"[basis] start [{args.universe}] — {args.minutes:.0f}min @ {args.interval:.0f}s · "
           f"{len(tokens)} tokens · {len(venues)} venues -> {args.csv}", flush=True)
     while time.time() < end:
-        mk = _marks(tokens, venues, hlxyz, txf)
+        mk = _marks(tokens, venues, hlxyz)
         ts = time.time()
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
         for va, vb in venue_pairs:
