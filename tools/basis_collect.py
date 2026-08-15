@@ -26,6 +26,7 @@ Sources KEYLESS (aucun secret) :
   * txflow      : POST /info {"type":"l2Book","coin":"<idx>"}  (CLOB HL-fork ; index connus BTC/ETH)
   * variational : GET /metadata/stats -> listings[]     (RFQ : mark_price/base_spread_bps)
   * vest        : GET /v2/exchangeInfo (map auto) + /v2/depth?symbol=  (CLOB)
+  * rise        : GET /api/v1/markets (map auto) + /api/v1/orderbook?market_id=  (CLOB, risechain)
 
 CSV (schema reversion_analyze) : iso_time,epoch,base,hedge,symbol,base_mid,hedge_mid,
   basis_bps,gross_bps,crossing_bps,spread,vol. base/hedge = VENUE ; spread = jambe la plus
@@ -50,7 +51,7 @@ UNIVERSES = {
     "crypto": {
         "tokens": ["BTC", "ETH", "SOL", "XRP", "BNB", "TRX", "DOGE", "ADA",
                    "AVAX", "LINK", "LTC", "DOT", "SUI", "TON", "BCH"],
-        "venues": ["extended", "lighter", "paradex", "hyperliquid", "txflow", "variational", "vest"],
+        "venues": ["extended", "lighter", "paradex", "hyperliquid", "txflow", "variational", "vest", "rise"],
         "hlxyz": {},
     },
     "rwa": {   # [!] equities FERMEES le WE -> lancer un jour de semaine (session US)
@@ -68,10 +69,13 @@ HL_URL    = "https://api.hyperliquid.xyz/info"
 TXF_URL   = "https://api.txflow.com/info"
 VAR_URL   = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
 VEST_URL  = "https://server-prod.hz.vestmarkets.com"
+RISE_MKTS = "https://api.rise.trade/api/v1/markets"          # id/nom/mark (rise.trade CLOB, risechain)
+RISE_OB   = "https://api.rise.trade/api/v1/orderbook"        # ?market_id=N -> bids/asks
 
 _LIT_IDS = {}    # token -> lighter market_id (auto)
 _VEST_SYM = {}   # token -> vest symbol (auto, ex BTC -> BTC-PERP)
 _TXF_IDX = {}    # token -> txflow l2Book index (auto, price-match ; meta/allMids 403)
+_RISE_ID = {}    # token -> rise market_id (auto, via /markets)
 
 
 def _get(url):
@@ -142,10 +146,20 @@ def _discover(tokens, venues):
                 _VEST_SYM[base] = s
     except Exception as e:
         print(f"[basis] vest syms KO: {type(e).__name__}: {e}", flush=True)
+    if "rise" in venues:
+        try:
+            for mk in _get(RISE_MKTS).get("data", {}).get("markets", []):
+                nm = str(mk.get("base_asset_symbol") or mk.get("config", {}).get("name", ""))
+                base = nm.split("/")[0].upper()
+                if base in tokset and mk.get("market_id") is not None:
+                    _RISE_ID[base] = str(mk["market_id"])
+        except Exception as e:
+            print(f"[basis] rise ids KO: {type(e).__name__}: {e}", flush=True)
     if "txflow" in venues:
         _discover_txflow(tokens)
     print(f"[basis] lighter ids: {_LIT_IDS}", flush=True)
     print(f"[basis] vest syms: {_VEST_SYM}", flush=True)
+    print(f"[basis] rise ids: {_RISE_ID}", flush=True)
     print(f"[basis] txflow idx (auto price-match): {_TXF_IDX}", flush=True)
 
 
@@ -257,6 +271,21 @@ def _marks(tokens, venues, hlxyz_map):
                 m = (bb + ba) / 2
                 spr = (ba - bb) / m * 1e4 if m > 0 else 0.0
                 out["vest"][t] = (m, spr, 0.0)
+            except Exception:
+                pass
+    if "rise" in venues:
+        for t, mid_id in _RISE_ID.items():
+            if t not in tokset:
+                continue
+            try:
+                d = _get(f"{RISE_OB}?market_id={mid_id}").get("data", {})
+                bids = d.get("bids") or []; asks = d.get("asks") or []
+                if not bids or not asks:
+                    continue
+                bid = float(bids[0]["price"]); ask = float(asks[0]["price"]); m = (bid + ask) / 2
+                spr = (ask - bid) / m * 1e4 if m > 0 else 0.0
+                sz = float(asks[0].get("quantity", 0) or 0)
+                out["rise"][t] = (m, spr, sz * m)
             except Exception:
                 pass
     return out
