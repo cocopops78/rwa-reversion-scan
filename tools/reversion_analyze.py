@@ -58,6 +58,10 @@ def main():
     ap.add_argument("csv")
     ap.add_argument("--min-n", type=int, default=30,
                     help="n minimal pour un verdict fiable (défaut 30)")
+    ap.add_argument("--max-spread", type=float, default=40.0,
+                    help="spread carnet moyen (bps) au-delà duquel le couloir = MIRAGE (feed cassé/illiquide)")
+    ap.add_argument("--by-token", action="store_true",
+                    help="grouper la sortie par TOKEN (comparer venue1:venue2 pour chaque token)")
     args = ap.parse_args()
 
     groups = collections.defaultdict(list)   # (base,hedge,sym) -> [(epoch,basis,gross,crossing)]
@@ -68,7 +72,8 @@ def main():
             # création) → statistics.mean([]) crash plus bas. Ici float lève → continue → rien créé.
             try:
                 rec = (float(r["epoch"]), float(r["basis_bps"]),
-                       float(r["gross_bps"]), float(r["crossing_bps"]))
+                       float(r["gross_bps"]), float(r["crossing_bps"]),
+                       float(r.get("spread", 0) or 0))
             except (KeyError, ValueError, TypeError):
                 continue
             groups[(r["base"], r["hedge"], r["symbol"])].append(rec)
@@ -77,8 +82,8 @@ def main():
         print(f"[reversion] aucune donnée exploitable dans {args.csv}")
         return
 
-    hdr = (f"{'SYM':6} {'base':11} {'hedge':10} {'n':>5} {'span_h':>6} {'basisμ':>7} "
-           f"{'basisσ':>7} {'grossσ':>7} {'demi-vie':>9} {'crois/h':>7} {'edge2σ':>7}  verdict")
+    hdr = (f"{'SYM':13} {'base':11} {'hedge':11} {'n':>5} {'span_h':>6} {'basisμ':>8} "
+           f"{'grossσ':>7} {'spread':>7} {'demi-vie':>9} {'crois/h':>7} {'edge2σ':>7}  verdict")
     print(hdr)
     print("-" * len(hdr))
     out = []
@@ -88,9 +93,10 @@ def main():
         ep = [z[0] for z in rows]
         basis = [z[1] for z in rows]
         gross = [z[2] for z in rows]
+        spr = [z[4] for z in rows]
         bmu = statistics.mean(basis)
-        bsig = statistics.pstdev(basis)
         gsig = statistics.pstdev(gross)
+        spread_mu = statistics.mean(spr) if spr else 0.0
         span_h = max((ep[-1] - ep[0]) / 3600.0, 1e-9)
         # pas d'échantillonnage médian (ignore les gros trous = checkpoints/reconnexions)
         dts = [ep[i] - ep[i - 1] for i in range(1, n) if 0 < ep[i] - ep[i - 1] < 3600]
@@ -101,7 +107,11 @@ def main():
         beta, hl = _halflife(x, dt_min)
         fees = 2 * (TAKER_BPS.get(base, 0.0) + TAKER_BPS.get(hedge, 0.0))
         edge = 2 * gsig - fees
-        if n < args.min_n:
+        # MIRAGE : carnet cassé/illiquide (spread énorme) → l'edge est un artefact de MID, PAS
+        # exécutable (ex paradex sur alts : spread 90-6470 bps). On MARQUE, on n'exclut pas la venue.
+        if spread_mu > args.max_spread:
+            verdict = f"MIRAGE spread={spread_mu:.0f}"
+        elif n < args.min_n:
             verdict = f"n<{args.min_n} (peu fiable)"
         elif hl is not None and hl < 240 and cph >= 1.0 and edge > 0:
             verdict = "REVIENT — piste"
@@ -111,19 +121,24 @@ def main():
             verdict = "DÉRIVE (pas de réversion)"
         else:
             verdict = "réversion faible/bruit"
-        out.append((sym, base, hedge, n, span_h, bmu, bsig, gsig, hl, cph, edge, verdict))
+        out.append((sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict))
 
-    # REVIENT d'abord, puis par edge2σ décroissant
-    out.sort(key=lambda r: (not r[11].startswith("REVIENT"), -r[10]))
-    for sym, base, hedge, n, span_h, bmu, bsig, gsig, hl, cph, edge, verdict in out:
+    if args.by_token:
+        # Par TOKEN (comparer venue1:venue2 pour chaque token), puis edge2σ décroissant.
+        out.sort(key=lambda r: (r[0].split("-")[0], -r[10]))
+    else:
+        # MIRAGE en dernier, REVIENT en premier, puis edge2σ décroissant.
+        out.sort(key=lambda r: (r[11].startswith("MIRAGE"), not r[11].startswith("REVIENT"), -r[10]))
+    for sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict in out:
         hl_s = f"{hl:>9.0f}" if hl is not None else f"{'—':>9}"
-        print(f"{sym:6} {base:11} {hedge:10} {n:>5} {span_h:>6.1f} {bmu:>+7.1f} "
-              f"{bsig:>7.1f} {gsig:>7.1f} {hl_s} {cph:>7.1f} {edge:>+7.1f}  {verdict}")
-    print("\nLecture : demi-vie (min) = retour à mi-écart vers l'offset μ (AR(1)) ; petit = réversion "
-          "rapide. crois/h = franchissements de μ par heure = fréquence des aller-retours. "
-          "edge2σ = 2·grossσ − feesRT. REVIENT = demi-vie<240min ET crois/h≥1 ET edge>0.")
-    print("RFQ (extended/variational) : marks cachés → σ & demi-vie biaisés (sauts d'escalier) ; "
-          "à confirmer. Venues carnet (hl-xyz/lighter/vest) = fiables.")
+        print(f"{sym:13} {base:11} {hedge:11} {n:>5} {span_h:>6.1f} {bmu:>+8.1f} "
+              f"{gsig:>7.1f} {spread_mu:>7.1f} {hl_s} {cph:>7.1f} {edge:>+7.1f}  {verdict}")
+    print("\nLecture : grossσ = amplitude d'oscillation ; spread = carnet moyen (jambe la plus mince, "
+          "garde-fou exécutabilité) ; edge2σ = 2·grossσ − feesRT. REVIENT = demi-vie<240min ET "
+          f"crois/h≥1 ET edge>0. MIRAGE = spread > {args.max_spread:.0f} bps (feed cassé → inexécutable).")
+    print("RFQ INCLUS (variational ; extended sur RWA) : marks cachés → σ possiblement gonflé, à "
+          "confirmer sur la durée. Venues carnet (lighter/extended/hyperliquid/vest) = fiables. "
+          "--by-token pour comparer par token.")
 
 
 if __name__ == "__main__":

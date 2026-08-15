@@ -13,8 +13,9 @@ venues RFQ (variational ; extended sur RWA) = MIRAGES de marks (σ gonfle) -> a 
 Deux UNIVERS (--universe) :
   * crypto : 15 bluechips x extended/lighter/paradex/hyperliquid/txflow/variational/vest — 24/7,
              OK le WEEKEND.
-  * rwa    : XAU/equities x extended/lighter/hl-xyz/variational/vest. [!] EQUITIES FERMEES le WE
-             -> lancer un JOUR DE SEMAINE (session US). hl-xyz cote le gold sous 'xyz:GOLD'.
+  * rwa    : XAU/equities x extended/lighter/hl-xyz/variational/vest. Les PERPS RWA (xyz:TSLA,
+             xyz:GOLD...) tradent 24/7 (moins liquides le WE, mais data reelle) -> OK le weekend
+             aussi ; l'action US sous-jacente est fermee mais le perp continue. hl-xyz = 'xyz:GOLD'.
 
 Sources KEYLESS (aucun secret) :
   * extended    : GET /api/v1/info/markets              (marketStats ; RWA extended = RFQ)
@@ -30,8 +31,9 @@ CSV (schema reversion_analyze) : iso_time,epoch,base,hedge,symbol,base_mid,hedge
   basis_bps,gross_bps,crossing_bps,spread,vol. base/hedge = VENUE ; spread = jambe la plus
   mince (bps, garde-fou executabilite) ; vol = profondeur min ($).
 
-[!] WEEKEND : vol crypto plus basse -> grossσ SOUS-estime (conservateur). EQUITIES fermees
--> universe=rwa a lancer en semaine.
+[!] WEEKEND : vol plus basse (crypto ET perps RWA) -> grossσ SOUS-estime (test conservateur).
+Les perps RWA tradent quand meme le WE (sous-jacent US ferme mais perp actif). Acqui sur
+PLUSIEURS JOURS recommandee avant tout verdict.
 
 Usage : python tools/basis_collect.py --universe crypto --minutes 330 --interval 60 --csv part.csv
 """
