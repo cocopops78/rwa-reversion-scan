@@ -55,9 +55,14 @@ UNIVERSES = {
         "hlxyz": {},
     },
     "rwa": {   # [!] equities FERMEES le WE -> lancer un jour de semaine (session US)
-        "tokens": ["XAU", "SPCX", "MRVL", "NVDA", "TSLA", "MU"],
+        # 4 commodities (or/argent/brent/wti) + TradFi/RWA. Communs txflow<->rise + hl-xyz/lighter/vest.
+        "tokens": ["XAU", "XAG", "BZ", "CL", "SPY", "QQQ", "MU", "SNDK", "SPCX", "DRAM",
+                   "MRVL", "NVDA", "TSLA"],
         "venues": ["extended", "lighter", "hl-xyz", "variational", "vest", "txflow", "rise"],
-        "hlxyz": {"XAU": "GOLD"},              # token -> ticker xyz ; gold = xyz:GOLD
+        # hl-xyz nomme differemment : XAU=GOLD, XAG=SILVER, SPY=SP500 (ATTENTION SP500=indice ~13x
+        # l'ETF SPY -> le garde-fou anti-mismatch d'echelle de reversion_analyze le relegue). BZ/QQQ
+        # absents de hl-xyz. Le reste (MU/SPCX/SNDK/DRAM/CL/MRVL/NVDA/TSLA) = meme nom.
+        "hlxyz": {"XAU": "GOLD", "XAG": "SILVER", "SPY": "SP500"},
     },
 }
 
@@ -160,7 +165,15 @@ def _discover(tokens, venues, hlxyz):
                     refp[t] = float(main[t])
         except Exception:
             pass
-        if any(t not in refp for t in tokens):  # RWA / tokens absents de HL main -> reference hl-xyz
+        if any(t not in refp for t in tokens) and "rise" in venues:  # RWA : rise (noms propres, MEME echelle que txflow)
+            try:
+                for mk in _get(RISE_MKTS).get("data", {}).get("markets", []):
+                    b = str(mk.get("base_asset_symbol") or mk.get("config", {}).get("name", "")).split("/")[0].upper()
+                    if b in tokset and b not in refp and mk.get("mark_price"):
+                        refp[b] = float(mk["mark_price"])
+            except Exception:
+                pass
+        if any(t not in refp for t in tokens):  # reste -> hl-xyz (noms mappes ; garde-fou echelle a l'analyse)
             try:
                 xyz = _post(HL_URL, {"type": "allMids", "dex": "xyz"})
                 for t in tokens:

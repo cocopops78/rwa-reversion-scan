@@ -63,6 +63,8 @@ def main():
                     help="spread carnet moyen (bps) au-delà duquel le couloir = MIRAGE (feed cassé/illiquide)")
     ap.add_argument("--by-token", action="store_true",
                     help="grouper la sortie par TOKEN (comparer venue1:venue2 pour chaque token)")
+    ap.add_argument("--max-basis", type=float, default=2000.0,
+                    help="|basisμ| (bps) au-dela = MISMATCH echelle/instrument (ex ETF SPY vs indice SP500)")
     args = ap.parse_args()
 
     groups = collections.defaultdict(list)   # (base,hedge,sym) -> [(epoch,basis,gross,crossing)]
@@ -112,6 +114,8 @@ def main():
         # exécutable (ex paradex sur alts : spread 90-6470 bps). On MARQUE, on n'exclut pas la venue.
         if spread_mu > args.max_spread:
             verdict = f"MIRAGE spread={spread_mu:.0f}"
+        elif abs(bmu) > args.max_basis:
+            verdict = f"MISMATCH basisμ={bmu:.0f}"   # instrument/echelle differents (ETF vs indice, XAUT vs XAU...)
         elif n < args.min_n:
             verdict = f"n<{args.min_n} (peu fiable)"
         elif hl is not None and hl < 240 and cph >= 1.0 and edge > 0:
@@ -128,8 +132,9 @@ def main():
         # Par TOKEN (comparer venue1:venue2 pour chaque token), puis edge2σ décroissant.
         out.sort(key=lambda r: (r[0].split("-")[0], -r[10]))
     else:
-        # MIRAGE en dernier, REVIENT en premier, puis edge2σ décroissant.
-        out.sort(key=lambda r: (r[11].startswith("MIRAGE"), not r[11].startswith("REVIENT"), -r[10]))
+        # MIRAGE/MISMATCH en dernier, REVIENT en premier, puis edge2σ décroissant.
+        out.sort(key=lambda r: (r[11].startswith(("MIRAGE", "MISMATCH")),
+                                not r[11].startswith("REVIENT"), -r[10]))
     for sym, base, hedge, n, span_h, bmu, gsig, spread_mu, hl, cph, edge, verdict in out:
         hl_s = f"{hl:>9.0f}" if hl is not None else f"{'—':>9}"
         print(f"{sym:13} {base:11} {hedge:11} {n:>5} {span_h:>6.1f} {bmu:>+8.1f} "
